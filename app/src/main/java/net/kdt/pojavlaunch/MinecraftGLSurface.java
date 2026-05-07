@@ -41,6 +41,7 @@ import androidx.annotation.Nullable;
 
 import ca.dnamobile.javalauncher.settings.LauncherPreferences;
 import ca.dnamobile.javalauncher.controls.TouchHotbarHitbox;
+import ca.dnamobile.javalauncher.controls.ControlsPreferences;
 import ca.dnamobile.javalauncher.input.GamepadMappingStore;
 import net.kdt.pojavlaunch.utils.JREUtils;
 
@@ -450,7 +451,7 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
                     // cursor movement as camera movement, so warping to the finger location
                     // makes the camera jump toward the touched edge/corner. Store the finger
                     // position only; send relative deltas after the drag passes touch slop.
-                    if (!touchUiTapCandidate) {
+                    if (!touchUiTapCandidate && ControlsPreferences.isMinecraftTouchGesturesEnabled(getContext())) {
                         scheduleTouchLongPressAttack();
                     }
                 } else {
@@ -471,7 +472,7 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
                     lastTouchY = y;
                     touchUiTapCandidate = isLikelyHotbarTap(x, y);
                     if (grabbed) {
-                        if (!touchUiTapCandidate) {
+                        if (!touchUiTapCandidate && ControlsPreferences.isMinecraftTouchGesturesEnabled(getContext())) {
                             scheduleTouchLongPressAttack();
                         }
                     } else {
@@ -508,8 +509,8 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
                     } else if (trackingTouch && !touchMovedPastSlop) {
                         if (touchUiTapCandidate || isLikelyHotbarTap(x, y)) {
                             sendHotbarSlotIfNeeded(x, y);
-                        } else {
-                            sendAttackTap();
+                        } else if (ControlsPreferences.isMinecraftTouchGesturesEnabled(getContext())) {
+                            sendUseTap();
                         }
                     }
                 } else {
@@ -833,9 +834,9 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
         }
     }
 
-    private void sendAttackTap() {
-        sendMouseButton(LwjglGlfwKeycode.GLFW_MOUSE_BUTTON_LEFT, true);
-        sendMouseButton(LwjglGlfwKeycode.GLFW_MOUSE_BUTTON_LEFT, false);
+    private void sendUseTap() {
+        sendMouseButton(LwjglGlfwKeycode.GLFW_MOUSE_BUTTON_RIGHT, true);
+        sendMouseButton(LwjglGlfwKeycode.GLFW_MOUSE_BUTTON_RIGHT, false);
     }
 
     private boolean sendHotbarSlotIfNeeded(float x, float y) {

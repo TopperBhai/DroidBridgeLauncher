@@ -54,9 +54,11 @@ final class TouchControlButtonView extends TextView {
     private static final int GLFW_KEY_A = 65;
     private static final int GLFW_KEY_S = 83;
     private static final int GLFW_KEY_D = 68;
-    private static final int GLFW_KEY_T = 84;
-    private static final int GLFW_KEY_SLASH = 47;
     private static final int GLFW_KEY_LEFT_CONTROL = 341;
+
+    private static final int GLFW_MOUSE_BUTTON_LEFT = 0;
+    private static final int GLFW_MOUSE_BUTTON_RIGHT = 1;
+    private static final int GLFW_MOUSE_BUTTON_MIDDLE = 2;
 
     private final TouchControlData data;
     private final Listener listener;
@@ -264,9 +266,7 @@ final class TouchControlButtonView extends TextView {
                     return true;
                 }
                 if (TouchControlActions.VIRTUAL_MOUSE.equals(data.action)) {
-                    boolean enabled = !ControlsPreferences.isVirtualMouseEnabled(getContext());
-                    ControlsPreferences.setVirtualMouseEnabled(getContext(), enabled);
-                    Toast.makeText(getContext(), enabled ? "Virtual cursor shown" : "Virtual cursor hidden", Toast.LENGTH_SHORT).show();
+                    toggleVirtualMouse();
                     performClick();
                     return true;
                 }
@@ -373,13 +373,8 @@ final class TouchControlButtonView extends TextView {
         try {
             CallbackBridge.setInputReady(true);
             if (TouchControlActions.KEY.equals(data.action)) {
-                for (int key : data.normalizedKeyCodes()) {
-                    if (key >= 0) {
-                        if (down && isChatOpenKey(key)) {
-                            TouchKeyboardHelper.markChatKeyPressed();
-                        }
-                        sendKey(key, down);
-                    }
+                for (int binding : data.normalizedKeyCodes()) {
+                    sendSlotBinding(binding, down);
                 }
                 return;
             }
@@ -399,8 +394,46 @@ final class TouchControlButtonView extends TextView {
         }
     }
 
-    private static boolean isChatOpenKey(int keyCode) {
-        return keyCode == GLFW_KEY_T || keyCode == GLFW_KEY_SLASH;
+    private void sendSlotBinding(int binding, boolean down) {
+        if (binding == 0) return;
+
+        switch (binding) {
+            case TouchControlData.SPECIAL_MOUSE_LEFT:
+                CallbackBridge.sendMouseButton(GLFW_MOUSE_BUTTON_LEFT, down);
+                return;
+            case TouchControlData.SPECIAL_MOUSE_RIGHT:
+                CallbackBridge.sendMouseButton(GLFW_MOUSE_BUTTON_RIGHT, down);
+                return;
+            case TouchControlData.SPECIAL_MOUSE_MIDDLE:
+                CallbackBridge.sendMouseButton(GLFW_MOUSE_BUTTON_MIDDLE, down);
+                return;
+            case TouchControlData.SPECIAL_SCROLL_UP:
+                if (!down) CallbackBridge.sendScroll(0d, 1d);
+                return;
+            case TouchControlData.SPECIAL_SCROLL_DOWN:
+                if (!down) CallbackBridge.sendScroll(0d, -1d);
+                return;
+            case TouchControlData.SPECIAL_KEYBOARD:
+                if (down) TouchKeyboardHelper.showKeyboard(this);
+                return;
+            case TouchControlData.SPECIAL_MENU:
+                if (down) listener.onMenuRequested();
+                return;
+            case TouchControlData.SPECIAL_TOGGLE_CONTROLS:
+                if (down) listener.onToggleControlsRequested();
+                return;
+            case TouchControlData.SPECIAL_VIRTUAL_MOUSE:
+                if (down) toggleVirtualMouse();
+                return;
+            default:
+                if (binding > 0) sendKey(binding, down);
+        }
+    }
+
+    private void toggleVirtualMouse() {
+        boolean enabled = !ControlsPreferences.isVirtualMouseEnabled(getContext());
+        ControlsPreferences.setVirtualMouseEnabled(getContext(), enabled);
+        Toast.makeText(getContext(), enabled ? "Virtual cursor shown" : "Virtual cursor hidden", Toast.LENGTH_SHORT).show();
     }
 
     private void sendKey(int keyCode, boolean down) {

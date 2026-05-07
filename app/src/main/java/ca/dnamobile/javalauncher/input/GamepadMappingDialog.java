@@ -66,6 +66,11 @@ public final class GamepadMappingDialog {
     private static final int COLOR_ACCENT = Color.rgb(37, 211, 128);
     private static final int COLOR_ACCENT_MUTED = Color.rgb(86, 135, 110);
 
+    private static final float DIALOG_DIM_NORMAL = 0.58f;
+    private static final float DIALOG_DIM_PREVIEW = 0.02f;
+    private static final float DIALOG_ALPHA_VISIBLE = 1.0f;
+    private static final float DIALOG_ALPHA_HITBOX_PREVIEW = 0.12f;
+
     public interface OnSettingsSavedListener {
         void onSettingsSaved();
     }
@@ -81,7 +86,9 @@ public final class GamepadMappingDialog {
         GamepadMappingStore store = GamepadMappingStore.get(activity);
 
         final boolean originalHotbarDebug = ControlsPreferences.isHotbarHitboxDebugEnabled(activity);
+        final int originalHotbarGuiScaleOverride = ControlsPreferences.getHotbarGuiScaleOverride(activity);
         final int originalMouseDpiScale = store.getHardwareMouseDpiScale();
+        final int originalResolutionScale = LauncherPreferences.getGameResolutionScalePercent(activity);
         final boolean[] saved = new boolean[]{false};
 
         ScrollView scrollView = new ScrollView(activity);
@@ -120,8 +127,8 @@ public final class GamepadMappingDialog {
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        Map<GamepadButton, Spinner> gameSpinners = new EnumMap<>(GamepadButton.class);
-        Map<GamepadButton, Spinner> menuSpinners = new EnumMap<>(GamepadButton.class);
+        Map<GamepadButton, Spinner[]> gameSpinners = new EnumMap<>(GamepadButton.class);
+        Map<GamepadButton, Spinner[]> menuSpinners = new EnumMap<>(GamepadButton.class);
 
         // Controller profile card.
         LinearLayout profileCard = addCard(activity, root);
@@ -201,23 +208,61 @@ public final class GamepadMappingDialog {
         SeekBar mouseDpiScale = addMouseDpiSeekBar(activity, overlayCard, store, store.getHardwareMouseDpiScale(), mouseDpiLabel, "Hardware mouse DPI scale");
         addSmallHint(activity, overlayCard, "This updates live while the dialog is open, and only affects real mouse/captured-pointer movement, not touch camera swipes or absolute menu taps.");
 
+        TextView resolutionScaleLabel = addResolutionScaleControl(
+                activity,
+                overlayCard,
+                "Game resolution scale",
+                LauncherPreferences.getGameResolutionScalePercent(activity)
+        );
+        SeekBar resolutionScale = addResolutionScaleSeekBar(
+                activity,
+                overlayCard,
+                LauncherPreferences.getGameResolutionScalePercent(activity),
+                resolutionScaleLabel,
+                "Game resolution scale",
+                listener
+        );
+        addSmallHint(activity, overlayCard, "Lower this for better FPS, raise it for sharper rendering. The live change is applied only when you release the slider so the game surface is not resized repeatedly while dragging.");
+
         // Hotbar card.
         LinearLayout hotbarCard = addCard(activity, root);
         addCardTitle(activity, hotbarCard, "Hotbar touch hitbox");
         addInfoText(activity, hotbarCard,
                 "Turn on the debug box to see the launcher hotbar touch area while in game. "
-                        + "If Minecraft GUI Scale is Auto or 4 and taps are unreliable, set GUI scale override to 4.");
+                        + "Auto match Minecraft follows Minecraft\'s current GUI scale when the hitbox is calculated. "
+                        + "Use a manual value only if a specific version/device needs an override.");
 
         CheckBox showHotbarHitbox = addCheckBox(activity, hotbarCard, "Show hotbar hitbox debug box", originalHotbarDebug);
 
-        String[] guiScaleLabels = new String[]{"Auto estimate", "2", "3", "4", "5", "6", "7", "8"};
+        String[] guiScaleLabels = new String[]{"Auto match Minecraft", "2", "3", "4", "5", "6", "7", "8"};
         int[] guiScaleValues = new int[]{0, 2, 3, 4, 5, 6, 7, 8};
-        TextView guiScaleLabel = addPlainLabel(activity, hotbarCard, "GUI scale override");
+        TextView guiScaleLabel = addPlainLabel(activity, hotbarCard, "Hotbar GUI scale");
         Spinner guiScaleSpinner = new Spinner(activity);
         ArrayAdapter<String> guiScaleAdapter = darkAdapter(activity, Arrays.asList(guiScaleLabels));
         guiScaleSpinner.setAdapter(guiScaleAdapter);
         guiScaleSpinner.setSelection(findGuiScaleIndex(guiScaleValues, ControlsPreferences.getHotbarGuiScaleOverride(activity)));
         hotbarCard.addView(guiScaleSpinner, matchWrapWithTopMargin(activity, 2));
+
+        final boolean[] guiScaleSpinnerReady = new boolean[]{false};
+        guiScaleSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (!guiScaleSpinnerReady[0]) {
+                    guiScaleSpinnerReady[0] = true;
+                    return;
+                }
+
+                ControlsPreferences.setHotbarGuiScaleOverride(
+                        activity,
+                        selectedGuiScaleValue(guiScaleValues, guiScaleSpinner)
+                );
+                notifySettingsChanged(activity, listener);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
 
         TextView hotbarWidthLabel = addFloatControl(activity, hotbarCard, "Hitbox width GUI px", ControlsPreferences.getHotbarWidthGui(activity));
         SeekBar hotbarWidth = addFloatSeekBar(activity, hotbarCard, 90, 260, ControlsPreferences.getHotbarWidthGui(activity), hotbarWidthLabel, "Hitbox width GUI px");
@@ -290,6 +335,7 @@ public final class GamepadMappingDialog {
                     store.setMenuCursorSensitivity(progressToSensitivity(menuSensitivity.getProgress()));
                     store.setGameCameraSensitivity(progressToSensitivity(gameSensitivity.getProgress()));
                     store.setHardwareMouseDpiScale(progressToMouseDpi(mouseDpiScale.getProgress()));
+                    LauncherPreferences.setGameResolutionScalePercent(activity, progressToResolutionScale(resolutionScale.getProgress()));
                     ControlsPreferences.setHotbarHitboxDebugEnabled(activity, showHotbarHitbox.isChecked());
                     ControlsPreferences.setHotbarGuiScaleOverride(activity, selectedGuiScaleValue(guiScaleValues, guiScaleSpinner));
                     ControlsPreferences.setHotbarWidthGui(activity, progressToFloat(hotbarWidth.getProgress(), 90));
@@ -305,6 +351,7 @@ public final class GamepadMappingDialog {
                     saved[0] = true;
                     store.resetDefaults();
                     ControlsPreferences.resetHotbarHitboxSettings(activity);
+                    LauncherPreferences.setGameResolutionScalePercent(activity, LauncherPreferences.DEFAULT_GAME_RESOLUTION_SCALE_PERCENT);
                     notifySettingsChanged(activity, listener);
                 })
                 .setNegativeButton(android.R.string.cancel, null)
@@ -312,10 +359,13 @@ public final class GamepadMappingDialog {
 
         activeDialog = dialog;
         dialog.setOnDismissListener(dismissed -> {
+            setActiveDialogHitboxPreviewAlpha(false);
             setActiveDialogPreviewAlpha(false);
             if (!saved[0]) {
                 ControlsPreferences.setHotbarHitboxDebugEnabled(activity, originalHotbarDebug);
+                ControlsPreferences.setHotbarGuiScaleOverride(activity, originalHotbarGuiScaleOverride);
                 store.setHardwareMouseDpiScale(originalMouseDpiScale);
+                LauncherPreferences.setGameResolutionScalePercent(activity, originalResolutionScale);
                 notifySettingsChanged(activity, listener);
             }
             activeDialog = null;
@@ -328,7 +378,7 @@ public final class GamepadMappingDialog {
         Window window = dialog.getWindow();
         if (window != null) {
             window.setBackgroundDrawable(roundedDrawable(activity, COLOR_DIALOG_BG, COLOR_DIALOG_BG, 22));
-            window.setDimAmount(0.58f);
+            window.setDimAmount(DIALOG_DIM_NORMAL);
         }
 
         tintDialogButton(dialog, AlertDialog.BUTTON_POSITIVE);
@@ -584,12 +634,12 @@ public final class GamepadMappingDialog {
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
-                setActiveDialogPreviewAlpha(true);
+                setActiveDialogHitboxPreviewAlpha(true);
             }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
-                setActiveDialogPreviewAlpha(false);
+                setActiveDialogHitboxPreviewAlpha(false);
             }
         });
         root.addView(seekBar, new LinearLayout.LayoutParams(
@@ -667,11 +717,28 @@ public final class GamepadMappingDialog {
         return seekBar;
     }
 
+    /**
+     * Used by non-visual tuning sliders such as cursor sensitivity, camera
+     * sensitivity, and hardware mouse DPI. These should keep the dialog fully
+     * visible because the user is not trying to line up a visual hitbox under it.
+     */
     private static void setActiveDialogPreviewAlpha(boolean previewing) {
         AlertDialog dialog = activeDialog;
         if (dialog == null || dialog.getWindow() == null) return;
-        dialog.getWindow().setDimAmount(previewing ? 0.02f : 0.32f);
-        dialog.getWindow().getDecorView().setAlpha(1.0f);
+        dialog.getWindow().setDimAmount(DIALOG_DIM_NORMAL);
+        dialog.getWindow().getDecorView().setAlpha(DIALOG_ALPHA_VISIBLE);
+    }
+
+    /**
+     * Used only by visual-preview sliders: game resolution scale and the hotbar
+     * hitbox size/offset/padding sliders. Fading the dialog lets the user see
+     * the hotbar debug box while dragging these controls.
+     */
+    private static void setActiveDialogHitboxPreviewAlpha(boolean previewing) {
+        AlertDialog dialog = activeDialog;
+        if (dialog == null || dialog.getWindow() == null) return;
+        dialog.getWindow().setDimAmount(previewing ? DIALOG_DIM_PREVIEW : DIALOG_DIM_NORMAL);
+        dialog.getWindow().getDecorView().setAlpha(previewing ? DIALOG_ALPHA_HITBOX_PREVIEW : DIALOG_ALPHA_VISIBLE);
     }
 
     private static int sensitivityToProgress(int sensitivity) {
@@ -762,6 +829,95 @@ public final class GamepadMappingDialog {
         return GamepadMappingStore.MIN_MOUSE_DPI_SCALE + progress;
     }
 
+    @NonNull
+    private static TextView addResolutionScaleControl(
+            @NonNull Activity activity,
+            @NonNull LinearLayout root,
+            @NonNull String title,
+            int resolutionScale
+    ) {
+        return addPlainLabel(activity, root, title + ": " + LauncherPreferences.clampGameResolutionScalePercent(resolutionScale) + "%");
+    }
+
+    @NonNull
+    private static SeekBar addResolutionScaleSeekBar(
+            @NonNull Activity activity,
+            @NonNull LinearLayout root,
+            int resolutionScale,
+            @NonNull TextView label,
+            @NonNull String title,
+            @Nullable OnSettingsSavedListener listener
+    ) {
+        SeekBar seekBar = new SeekBar(activity);
+        tintSeekBar(seekBar);
+        seekBar.setMax(LauncherPreferences.MAX_GAME_RESOLUTION_SCALE_PERCENT - LauncherPreferences.MIN_GAME_RESOLUTION_SCALE_PERCENT);
+        seekBar.setProgress(resolutionScaleToProgress(resolutionScale));
+
+        label.setOnClickListener(v -> showNumberInputDialog(
+                activity,
+                title,
+                progressToResolutionScale(seekBar.getProgress()),
+                LauncherPreferences.MIN_GAME_RESOLUTION_SCALE_PERCENT,
+                LauncherPreferences.MAX_GAME_RESOLUTION_SCALE_PERCENT,
+                "%",
+                newValue -> {
+                    int clamped = LauncherPreferences.clampGameResolutionScalePercent(newValue);
+                    seekBar.setProgress(resolutionScaleToProgress(clamped));
+                    applyGameResolutionScale(activity, clamped, label, title, listener);
+                }
+        ));
+        label.setText(title + ": " + progressToResolutionScale(seekBar.getProgress()) + "%");
+
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                label.setText(title + ": " + progressToResolutionScale(progress) + "%");
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                setActiveDialogHitboxPreviewAlpha(true);
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                applyGameResolutionScale(activity, progressToResolutionScale(seekBar.getProgress()), label, title, listener);
+                setActiveDialogHitboxPreviewAlpha(false);
+            }
+        });
+        root.addView(seekBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+        return seekBar;
+    }
+
+    private static void applyGameResolutionScale(
+            @NonNull Activity activity,
+            int resolutionScale,
+            @NonNull TextView label,
+            @NonNull String title,
+            @Nullable OnSettingsSavedListener listener
+    ) {
+        int clamped = LauncherPreferences.clampGameResolutionScalePercent(resolutionScale);
+        LauncherPreferences.setGameResolutionScalePercent(activity, clamped);
+        label.setText(title + ": " + clamped + "%");
+        notifySettingsChanged(activity, listener);
+    }
+
+    private static int resolutionScaleToProgress(int resolutionScale) {
+        return Math.max(0, Math.min(
+                LauncherPreferences.MAX_GAME_RESOLUTION_SCALE_PERCENT - LauncherPreferences.MIN_GAME_RESOLUTION_SCALE_PERCENT,
+                LauncherPreferences.clampGameResolutionScalePercent(resolutionScale) - LauncherPreferences.MIN_GAME_RESOLUTION_SCALE_PERCENT
+        ));
+    }
+
+    private static int progressToResolutionScale(int progress) {
+        return LauncherPreferences.clampGameResolutionScalePercent(
+                LauncherPreferences.MIN_GAME_RESOLUTION_SCALE_PERCENT + progress
+        );
+    }
+
     private interface NumberValueCallback {
         void onValueSelected(int value);
     }
@@ -850,30 +1006,50 @@ public final class GamepadMappingDialog {
             boolean gameMode,
             @NonNull GamepadMappingStore store,
             @NonNull String profileKey,
-            @NonNull Map<GamepadButton, Spinner> out
+            @NonNull Map<GamepadButton, Spinner[]> out
     ) {
         ArrayAdapter<GamepadAction> adapter = darkAdapter(activity, Arrays.asList(GamepadAction.values()));
 
         for (GamepadButton button : GamepadButton.values()) {
-            LinearLayout row = new LinearLayout(activity);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
+            LinearLayout group = new LinearLayout(activity);
+            group.setOrientation(LinearLayout.VERTICAL);
+            group.setPadding(0, dp(activity, 6), 0, dp(activity, 8));
 
             TextView label = new TextView(activity);
             label.setText(button.toString());
             label.setTextSize(14);
+            label.setTypeface(Typeface.DEFAULT_BOLD);
             label.setTextColor(COLOR_TEXT_SECONDARY);
+            label.setPadding(0, 0, 0, dp(activity, 3));
+            group.addView(label, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            ));
 
-            Spinner spinner = new Spinner(activity);
-            spinner.setAdapter(adapter);
-            spinner.setSelection(store.getButtonAction(button, gameMode, profileKey).ordinal());
+            Spinner[] slots = new Spinner[GamepadMappingStore.MAX_ACTION_SLOTS];
+            for (int slot = 0; slot < GamepadMappingStore.MAX_ACTION_SLOTS; slot++) {
+                LinearLayout row = new LinearLayout(activity);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(activity, 12), dp(activity, 2), 0, dp(activity, 2));
 
-            row.addView(label, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            row.addView(spinner, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.45f));
+                TextView slotLabel = new TextView(activity);
+                slotLabel.setText("Position " + slot);
+                slotLabel.setTextSize(12);
+                slotLabel.setTextColor(COLOR_TEXT_MUTED);
 
-            root.addView(row);
-            out.put(button, spinner);
+                Spinner spinner = new Spinner(activity);
+                spinner.setAdapter(adapter);
+                spinner.setSelection(store.getButtonActionSlot(button, gameMode, profileKey, slot).ordinal());
+
+                row.addView(slotLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.75f));
+                row.addView(spinner, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.6f));
+                group.addView(row);
+                slots[slot] = spinner;
+            }
+
+            root.addView(group);
+            out.put(button, slots);
         }
     }
 
@@ -881,10 +1057,15 @@ public final class GamepadMappingDialog {
             @NonNull GamepadMappingStore store,
             @NonNull String profileKey,
             boolean gameMode,
-            @NonNull Map<GamepadButton, Spinner> spinners
+            @NonNull Map<GamepadButton, Spinner[]> spinners
     ) {
-        for (Map.Entry<GamepadButton, Spinner> entry : spinners.entrySet()) {
-            entry.getValue().setSelection(store.getButtonAction(entry.getKey(), gameMode, profileKey).ordinal());
+        for (Map.Entry<GamepadButton, Spinner[]> entry : spinners.entrySet()) {
+            Spinner[] slots = entry.getValue();
+            for (int slot = 0; slot < slots.length; slot++) {
+                if (slots[slot] != null) {
+                    slots[slot].setSelection(store.getButtonActionSlot(entry.getKey(), gameMode, profileKey, slot).ordinal());
+                }
+            }
         }
     }
 
@@ -892,12 +1073,17 @@ public final class GamepadMappingDialog {
             @NonNull GamepadMappingStore store,
             @NonNull String profileKey,
             boolean gameMode,
-            @NonNull Map<GamepadButton, Spinner> spinners
+            @NonNull Map<GamepadButton, Spinner[]> spinners
     ) {
-        for (Map.Entry<GamepadButton, Spinner> entry : spinners.entrySet()) {
-            Object selected = entry.getValue().getSelectedItem();
-            if (selected instanceof GamepadAction) {
-                store.setButtonAction(entry.getKey(), (GamepadAction) selected, gameMode, profileKey);
+        for (Map.Entry<GamepadButton, Spinner[]> entry : spinners.entrySet()) {
+            Spinner[] slots = entry.getValue();
+            for (int slot = 0; slot < slots.length; slot++) {
+                Spinner spinner = slots[slot];
+                if (spinner == null) continue;
+                Object selected = spinner.getSelectedItem();
+                if (selected instanceof GamepadAction) {
+                    store.setButtonActionSlot(entry.getKey(), (GamepadAction) selected, gameMode, profileKey, slot);
+                }
             }
         }
     }

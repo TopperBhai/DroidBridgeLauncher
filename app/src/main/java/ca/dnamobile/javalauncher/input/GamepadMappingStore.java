@@ -54,13 +54,14 @@ public final class GamepadMappingStore {
     private static final String GAME_CAMERA_SENSITIVITY = "game_camera_sensitivity";
     private static final String HARDWARE_MOUSE_DPI_SCALE = "hardware_mouse_dpi_scale";
 
-    private static final int CURRENT_PREF_VERSION = 8;
+    private static final int CURRENT_PREF_VERSION = 9;
     private static final int DEFAULT_SENSITIVITY = 100;
     private static final int DEFAULT_MOUSE_DPI_SCALE = 100;
     public static final int MIN_SENSITIVITY = 25;
     public static final int MAX_SENSITIVITY = 200;
     public static final int MIN_MOUSE_DPI_SCALE = 25;
     public static final int MAX_MOUSE_DPI_SCALE = 300;
+    public static final int MAX_ACTION_SLOTS = 4;
 
     private static volatile GamepadMappingStore instance;
 
@@ -245,7 +246,7 @@ public final class GamepadMappingStore {
 
     @NonNull
     public GamepadAction getButtonAction(@NonNull GamepadButton button, boolean gameMode) {
-        return getButtonAction(button, gameMode, getActiveProfileKey());
+        return getButtonActionSlot(button, gameMode, getActiveProfileKey(), 0);
     }
 
     @NonNull
@@ -254,11 +255,72 @@ public final class GamepadMappingStore {
             boolean gameMode,
             @Nullable InputDevice device
     ) {
-        return getButtonAction(button, gameMode, profileKeyForDevice(device));
+        return getButtonActionSlot(button, gameMode, profileKeyForDevice(device), 0);
     }
 
     @NonNull
     public GamepadAction getButtonAction(
+            @NonNull GamepadButton button,
+            boolean gameMode,
+            @Nullable String profileKey
+    ) {
+        return getButtonActionSlot(button, gameMode, profileKey, 0);
+    }
+
+    @NonNull
+    public GamepadAction[] getButtonActions(
+            @NonNull GamepadButton button,
+            boolean gameMode,
+            @Nullable InputDevice device
+    ) {
+        return getButtonActions(button, gameMode, profileKeyForDevice(device));
+    }
+
+    @NonNull
+    public GamepadAction[] getButtonActions(
+            @NonNull GamepadButton button,
+            boolean gameMode,
+            @Nullable String profileKey
+    ) {
+        GamepadAction[] actions = new GamepadAction[MAX_ACTION_SLOTS];
+        for (int slot = 0; slot < MAX_ACTION_SLOTS; slot++) {
+            actions[slot] = getButtonActionSlot(button, gameMode, profileKey, slot);
+        }
+        return actions;
+    }
+
+    @NonNull
+    public GamepadAction getButtonActionSlot(
+            @NonNull GamepadButton button,
+            boolean gameMode,
+            @Nullable String profileKey,
+            int slot
+    ) {
+        int safeSlot = clampActionSlot(slot);
+        if (safeSlot == 0) {
+            return getPrimaryButtonAction(button, gameMode, profileKey);
+        }
+
+        String safeProfile = isValidProfileKey(profileKey) ? profileKey : DEFAULT_PROFILE;
+        GamepadAction action = readStoredAction(keyForSlot(safeProfile, button, gameMode, safeSlot));
+        if (action != null) return action;
+
+        String activeProfile = getActiveProfileKey();
+        if (!DEFAULT_PROFILE.equals(activeProfile) && !activeProfile.equals(safeProfile)) {
+            action = readStoredAction(keyForSlot(activeProfile, button, gameMode, safeSlot));
+            if (action != null) return action;
+        }
+
+        if (!DEFAULT_PROFILE.equals(safeProfile)) {
+            action = readStoredAction(keyForSlot(DEFAULT_PROFILE, button, gameMode, safeSlot));
+            if (action != null) return action;
+        }
+
+        return GamepadAction.NONE;
+    }
+
+    @NonNull
+    private GamepadAction getPrimaryButtonAction(
             @NonNull GamepadButton button,
             boolean gameMode,
             @Nullable String profileKey
@@ -292,7 +354,7 @@ public final class GamepadMappingStore {
             @NonNull GamepadAction action,
             boolean gameMode
     ) {
-        setButtonAction(button, action, gameMode, getActiveProfileKey());
+        setButtonActionSlot(button, action, gameMode, getActiveProfileKey(), 0);
     }
 
     public void setButtonAction(
@@ -301,10 +363,31 @@ public final class GamepadMappingStore {
             boolean gameMode,
             @Nullable String profileKey
     ) {
+        setButtonActionSlot(button, action, gameMode, profileKey, 0);
+    }
+
+    public void setButtonActionSlot(
+            @NonNull GamepadButton button,
+            @NonNull GamepadAction action,
+            boolean gameMode,
+            @Nullable String profileKey,
+            int slot
+    ) {
         String safeProfile = isValidProfileKey(profileKey) ? profileKey : DEFAULT_PROFILE;
-        prefs.edit()
-                .putString(keyFor(safeProfile, button, gameMode), action.name())
-                .apply();
+        int safeSlot = clampActionSlot(slot);
+        String key = safeSlot == 0
+                ? keyFor(safeProfile, button, gameMode)
+                : keyForSlot(safeProfile, button, gameMode, safeSlot);
+        prefs.edit().putString(key, action.name()).apply();
+    }
+
+    public void clearButtonActionSlot(
+            @NonNull GamepadButton button,
+            boolean gameMode,
+            @Nullable String profileKey,
+            int slot
+    ) {
+        setButtonActionSlot(button, GamepadAction.NONE, gameMode, profileKey, slot);
     }
 
     public void resetDefaults() {
@@ -377,6 +460,20 @@ public final class GamepadMappingStore {
             return keyFor(button, gameMode);
         }
         return PROFILE_PREFIX + profileKey + "." + (gameMode ? GAME_PREFIX : MENU_PREFIX) + button.name();
+    }
+
+    @NonNull
+    private static String keyForSlot(
+            @NonNull String profileKey,
+            @NonNull GamepadButton button,
+            boolean gameMode,
+            int slot
+    ) {
+        return keyFor(profileKey, button, gameMode) + ".slot" + clampActionSlot(slot);
+    }
+
+    private static int clampActionSlot(int slot) {
+        return Math.max(0, Math.min(MAX_ACTION_SLOTS - 1, slot));
     }
 
     private static boolean isValidProfileKey(@Nullable String profileKey) {

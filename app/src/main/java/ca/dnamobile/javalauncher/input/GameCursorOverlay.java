@@ -13,12 +13,15 @@
 package ca.dnamobile.javalauncher.input;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.view.Choreographer;
 import android.view.MotionEvent;
@@ -27,6 +30,8 @@ import android.view.ViewGroup;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+
+import java.io.File;
 
 import ca.dnamobile.javalauncher.controls.ControlsPreferences;
 
@@ -47,27 +52,41 @@ import org.lwjgl.glfw.CallbackBridge;
  * Minecraft menu clicks continue to reach the game surface underneath.
  */
 public final class GameCursorOverlay extends View {
-    private static final float CURSOR_CANVAS_DP = 42f;
+    private static final float CURSOR_CANVAS_DP = 28f;
 
     private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path cursorPath = new Path();
     private final GamepadMappingStore mappingStore;
+    @Nullable private Bitmap cursorBitmap;
+    @NonNull private String loadedCursorStyle = "";
+    @Nullable private String loadedCustomCursorPath;
+    private int loadedCursorSizePercent = -1;
 
     @Nullable private ViewGroup overlayParent;
     private boolean drawableAdded;
     private boolean removed;
     private boolean cursorVisible;
+    private boolean lastMenuMode;
+    private boolean lastShouldShow;
 
     private final Drawable cursorDrawable = new Drawable() {
         @Override
         public void draw(@NonNull Canvas canvas) {
             if (!cursorVisible) return;
 
+            Rect bounds = getBounds();
+            if (bounds.width() <= 0 || bounds.height() <= 0) return;
+
+            Bitmap bitmap = cursorBitmap;
+            if (bitmap != null && !bitmap.isRecycled()) {
+                canvas.drawBitmap(bitmap, null, bounds, null);
+                return;
+            }
+
             canvas.save();
-            canvas.translate(getBounds().left, getBounds().top);
-            canvas.drawPath(cursorPath, fillPaint);
-            canvas.drawPath(cursorPath, strokePaint);
+            canvas.translate(bounds.left, bounds.top);
+            drawFallbackCrosshair(canvas, bounds.width(), bounds.height());
             canvas.restore();
         }
 
@@ -104,6 +123,7 @@ public final class GameCursorOverlay extends View {
     public GameCursorOverlay(@NonNull Context context) {
         super(context);
         mappingStore = GamepadMappingStore.get(context);
+        reloadCursorBitmapIfNeeded(true);
 
         // This view is only a lifecycle owner for the overlay drawable.
         // Keep it out of layout hit testing completely.
@@ -123,7 +143,13 @@ public final class GameCursorOverlay extends View {
 
         strokePaint.setColor(Color.BLACK);
         strokePaint.setStyle(Paint.Style.STROKE);
-        strokePaint.setStrokeWidth(dp(1.5f));
+        strokePaint.setStrokeWidth(dp(4.0f));
+        strokePaint.setStrokeCap(Paint.Cap.ROUND);
+        strokePaint.setStrokeJoin(Paint.Join.ROUND);
+        fillPaint.setStrokeWidth(dp(1.8f));
+        fillPaint.setStrokeCap(Paint.Cap.ROUND);
+        fillPaint.setStrokeJoin(Paint.Join.ROUND);
+        fillPaint.setStyle(Paint.Style.STROKE);
 
         buildPath();
 
@@ -176,41 +202,114 @@ public final class GameCursorOverlay extends View {
     }
 
     private void buildPath() {
-        float s = dp(1f);
+        // The old GameCursorOverlay drew a classic arrow here. That caused the
+        // visible "mouse over crosshair" bug once TouchControlsOverlay also
+        // drew the Mojo-style pointer. Keep the method for source compatibility;
+        // drawing now happens through drawFallbackCrosshair() or the bundled
+        // ic_gamepad_pointer.png asset.
         cursorPath.reset();
+    }
 
-        // Classic simple arrow pointer.
-        cursorPath.moveTo(0f, 0f);
-        cursorPath.lineTo(0f, 22f * s);
-        cursorPath.lineTo(6f * s, 16f * s);
-        cursorPath.lineTo(10f * s, 27f * s);
-        cursorPath.lineTo(15f * s, 25f * s);
-        cursorPath.lineTo(11f * s, 14f * s);
-        cursorPath.lineTo(19f * s, 14f * s);
-        cursorPath.close();
+    private void drawFallbackCrosshair(@NonNull Canvas canvas, int width, int height) {
+        float centerX = width / 2f;
+        float centerY = height / 2f;
+        float density = getResources().getDisplayMetrics().density;
+        float arm = 11f * density;
+        float gap = 3.5f * density;
+        float ringRadius = 6.5f * density;
+
+        drawCrosshairLines(canvas, centerX, centerY, arm, gap, ringRadius, strokePaint);
+        drawCrosshairLines(canvas, centerX, centerY, arm, gap, ringRadius, fillPaint);
+    }
+
+    private static void drawCrosshairLines(
+            @NonNull Canvas canvas,
+            float x,
+            float y,
+            float arm,
+            float gap,
+            float ringRadius,
+            @NonNull Paint paint
+    ) {
+        canvas.drawLine(x - arm, y, x - gap, y, paint);
+        canvas.drawLine(x + gap, y, x + arm, y, paint);
+        canvas.drawLine(x, y - arm, x, y - gap, paint);
+        canvas.drawLine(x, y + gap, x, y + arm, paint);
+        canvas.drawCircle(x, y, ringRadius, paint);
+    }
+
+    private void reloadCursorBitmapIfNeeded(boolean force) {
+        String style = ControlsPreferences.getMouseCursorStyle(getContext());
+        String customPath = ControlsPreferences.getCustomMouseCursorPath(getContext());
+        int sizePercent = ControlsPreferences.getMouseCursorSizePercent(getContext());
+
+        boolean sameStyle = style.equals(loadedCursorStyle);
+        boolean samePath = customPath == null ? loadedCustomCursorPath == null : customPath.equals(loadedCustomCursorPath);
+        boolean sameSize = sizePercent == loadedCursorSizePercent;
+        if (!force && sameStyle && samePath && sameSize) return;
+
+        loadedCursorStyle = style;
+        loadedCustomCursorPath = customPath;
+        loadedCursorSizePercent = sizePercent;
+        cursorBitmap = loadCursorBitmap(getContext(), style, customPath);
+        cursorDrawable.invalidateSelf();
+    }
+
+    @Nullable
+    private static Bitmap loadCursorBitmap(
+            @NonNull Context context,
+            @NonNull String style,
+            @Nullable String customPath
+    ) {
+        if (ControlsPreferences.MOUSE_CURSOR_STYLE_CUSTOM.equals(style) && customPath != null) {
+            try {
+                File file = new File(customPath);
+                if (file.isFile() && file.length() > 0L) {
+                    Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
+                    if (bitmap != null) return bitmap;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        try {
+            int id = context.getResources().getIdentifier(
+                    ControlsPreferences.getMouseCursorResourceName(style),
+                    "drawable",
+                    context.getPackageName()
+            );
+            return id != 0 ? BitmapFactory.decodeResource(context.getResources(), id) : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private void updateFromBridge() {
         attachDrawableToParent();
+        reloadCursorBitmapIfNeeded(false);
 
         boolean menuMode = !mappingStore.isForceGameMode() && !CallbackBridge.isGrabbing();
         boolean physicalPointerConnected = hasPhysicalPointerDevice();
 
-        // The virtual mouse preference only means "draw a cursor when Minecraft is
-        // in a GUI/menu". It must not force a cursor while the game is grabbing
-        // mouse input, because grabbed mode means the pointer is being used as
-        // camera/attack input inside the world. It also hides when a real mouse,
-        // trackpad, or trackball is connected because the hardware pointer should
-        // become the only visible cursor.
+        // Touch virtual mouse and controller cursor are both menu cursors.
+        // The controller cursor must still show when a controller is attached;
+        // some Android handhelds expose controller hardware with pointer-ish
+        // sources, so do not let physicalPointerConnected hide controller mode.
         boolean showTouchVirtualCursor = ControlsPreferences.isVirtualMouseEnabled(getContext())
                 && menuMode
                 && !physicalPointerConnected;
         boolean showControllerMenuCursor = mappingStore.isShowCursorOverlay()
-                && menuMode
-                && !physicalPointerConnected;
+                && menuMode;
         boolean shouldShow = showTouchVirtualCursor || showControllerMenuCursor;
 
+        if (shouldShow && (!lastShouldShow || (!lastMenuMode && menuMode))) {
+            resetBridgeCursorToCenter();
+        }
+
+        lastMenuMode = menuMode;
+        lastShouldShow = shouldShow;
         cursorVisible = shouldShow;
+
         if (!shouldShow || overlayParent == null) {
             cursorDrawable.setBounds(0, 0, 0, 0);
             cursorDrawable.invalidateSelf();
@@ -219,7 +318,11 @@ public final class GameCursorOverlay extends View {
 
         int rootWidth = Math.max(1, overlayParent.getWidth());
         int rootHeight = Math.max(1, overlayParent.getHeight());
-        int cursorSize = Math.max(1, Math.round(dp(CURSOR_CANVAS_DP)));
+        int cursorSize = Math.max(1, Math.round(
+                dp(CURSOR_CANVAS_DP)
+                        * ControlsPreferences.getMouseCursorSizePercent(getContext())
+                        / 100f
+        ));
 
         float bridgeWidth = Math.max(1f, CallbackBridge.windowWidth > 0
                 ? CallbackBridge.windowWidth : CallbackBridge.physicalWidth);
@@ -229,17 +332,29 @@ public final class GameCursorOverlay extends View {
         float drawX = CallbackBridge.mouseX * rootWidth / bridgeWidth;
         float drawY = CallbackBridge.mouseY * rootHeight / bridgeHeight;
 
-        // The cursor path hotspot is the top-left arrow tip. Do not clamp the
-        // whole 42dp drawable inside the screen, because that makes the pointer
-        // look like it cannot reach the right/bottom edge. Let the drawable hang
-        // off-screen like a desktop cursor and only clamp the hotspot itself.
+        // Crosshair hotspot is its centre. Clamp the hotspot, not the whole
+        // drawable, so the cursor can still reach the screen edges naturally.
         drawX = clamp(drawX, 0f, Math.max(0f, rootWidth - 1f));
         drawY = clamp(drawY, 0f, Math.max(0f, rootHeight - 1f));
 
-        int left = Math.round(drawX);
-        int top = Math.round(drawY);
+        int left = Math.round(drawX - (cursorSize / 2f));
+        int top = Math.round(drawY - (cursorSize / 2f));
         cursorDrawable.setBounds(left, top, left + cursorSize, top + cursorSize);
         cursorDrawable.invalidateSelf();
+    }
+
+    private static void resetBridgeCursorToCenter() {
+        try {
+            float width = Math.max(1f, CallbackBridge.windowWidth > 0
+                    ? CallbackBridge.windowWidth : CallbackBridge.physicalWidth);
+            float height = Math.max(1f, CallbackBridge.windowHeight > 0
+                    ? CallbackBridge.windowHeight : CallbackBridge.physicalHeight);
+            CallbackBridge.setInputReady(true);
+            CallbackBridge.mouseX = Math.max(0f, width - 1f) / 2f;
+            CallbackBridge.mouseY = Math.max(0f, height - 1f) / 2f;
+            CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+        } catch (Throwable ignored) {
+        }
     }
 
     private static boolean hasPhysicalPointerDevice() {

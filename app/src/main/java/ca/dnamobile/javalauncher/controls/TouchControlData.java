@@ -32,12 +32,14 @@ public final class TouchControlData {
     public static final int SPECIAL_SCROLL_UP = -7;
     public static final int SPECIAL_SCROLL_DOWN = -8;
     public static final int SPECIAL_MENU = -9;
+    public static final int MAX_ACTION_SLOTS = 4;
 
     @NonNull public String id = UUID.randomUUID().toString();
     @NonNull public String label = "Button";
     @NonNull public String action = TouchControlActions.KEY;
     public int keyCode = 32;
     @NonNull public int[] keyCodes = new int[0];
+    @NonNull public int[] keySlots = new int[0];
     public int mouseButton = 0;
     public int scrollY = 0;
     public float x = 32f;
@@ -70,7 +72,7 @@ public final class TouchControlData {
         data.label = label;
         data.action = TouchControlActions.KEY;
         data.keyCode = keyCode;
-        data.keyCodes = new int[]{keyCode};
+        data.setKeyCodes(new int[]{keyCode});
         data.x = x;
         data.y = y;
         data.width = width;
@@ -115,6 +117,7 @@ public final class TouchControlData {
         copy.action = action;
         copy.keyCode = keyCode;
         copy.keyCodes = keyCodes != null ? keyCodes.clone() : new int[0];
+        copy.keySlots = keySlots != null ? keySlots.clone() : new int[0];
         copy.mouseButton = mouseButton;
         copy.scrollY = scrollY;
         copy.x = x;
@@ -148,6 +151,9 @@ public final class TouchControlData {
         JSONArray keys = new JSONArray();
         for (int code : normalizedKeyCodes()) keys.put(code);
         json.put("keyCodes", keys);
+        JSONArray slots = new JSONArray();
+        for (int code : normalizedKeySlots()) slots.put(code);
+        json.put("keySlots", slots);
         json.put("mouseButton", mouseButton);
         json.put("scrollY", scrollY);
         json.put("x", x);
@@ -178,7 +184,9 @@ public final class TouchControlData {
         data.label = json.optString("label", json.optString("name", data.label));
         data.action = json.optString("action", data.action);
         data.keyCode = json.optInt("keyCode", data.keyCode);
-        data.keyCodes = readKeyCodes(json.optJSONArray("keyCodes"), data.keyCode);
+        data.keySlots = readKeySlots(json.optJSONArray("keySlots"), json.optJSONArray("keyCodes"), data.keyCode);
+        data.keyCodes = activeCodesFromSlots(data.keySlots);
+        data.keyCode = firstUsableKey(data.keyCodes, 0);
         data.mouseButton = json.optInt("mouseButton", data.mouseButton);
         data.scrollY = json.optInt("scrollY", data.scrollY);
         data.x = (float) json.optDouble("x", data.x);
@@ -283,25 +291,100 @@ public final class TouchControlData {
 
     @NonNull
     public int[] normalizedKeyCodes() {
-        if (keyCodes != null && keyCodes.length > 0) return keyCodes;
-        return new int[]{keyCode};
+        if (keySlots != null && keySlots.length > 0) {
+            return activeCodesFromSlots(toFixedSlots(keySlots, 0));
+        }
+        if (keyCodes != null && keyCodes.length > 0) return activeCodesFromSlots(toFixedSlots(keyCodes, keyCode));
+        return keyCode == 0 ? new int[0] : new int[]{keyCode};
+    }
+
+    @NonNull
+    public int[] normalizedKeySlots() {
+        if (keySlots != null && keySlots.length > 0) return toFixedSlots(keySlots, 0);
+        if (keyCodes != null && keyCodes.length > 0) return toFixedSlots(keyCodes, keyCode);
+        return toFixedSlots(keyCode == 0 ? new int[0] : new int[]{keyCode}, keyCode);
+    }
+
+    public int getKeySlot(int slot) {
+        int safeSlot = Math.max(0, Math.min(MAX_ACTION_SLOTS - 1, slot));
+        int[] slots = normalizedKeySlots();
+        return safeSlot < slots.length ? slots[safeSlot] : 0;
+    }
+
+    public void setKeySlot(int slot, int keyCodeValue) {
+        int safeSlot = Math.max(0, Math.min(MAX_ACTION_SLOTS - 1, slot));
+        int[] slots = normalizedKeySlots();
+        slots[safeSlot] = keyCodeValue;
+        setKeySlots(slots);
+    }
+
+    public void clearKeySlot(int slot) {
+        setKeySlot(slot, 0);
     }
 
     public void setKeyCodes(@NonNull int[] codes) {
-        keyCodes = codes.length == 0 ? new int[]{keyCode} : codes.clone();
-        keyCode = keyCodes[0];
+        setKeySlots(toFixedSlots(codes, 0));
+    }
+
+    public void setKeySlots(@NonNull int[] slots) {
+        keySlots = toFixedSlots(slots, 0);
+        keyCodes = activeCodesFromSlots(keySlots);
+        keyCode = firstUsableKey(keyCodes, 0);
+    }
+
+    @NonNull
+    private static int[] readKeySlots(@Nullable JSONArray slotArray, @Nullable JSONArray legacyArray, int fallback) {
+        if (slotArray != null && slotArray.length() > 0) {
+            return toFixedSlots(readRawCodes(slotArray), fallback);
+        }
+        return toFixedSlots(readKeyCodes(legacyArray, fallback), fallback);
     }
 
     @NonNull
     private static int[] readKeyCodes(@Nullable JSONArray array, int fallback) {
-        if (array == null || array.length() == 0) return new int[]{fallback};
+        int[] raw = readRawCodes(array);
+        if (raw.length == 0) return fallback == 0 ? new int[0] : new int[]{fallback};
+        return activeCodesFromSlots(raw);
+    }
+
+    @NonNull
+    private static int[] readRawCodes(@Nullable JSONArray array) {
+        if (array == null || array.length() == 0) return new int[0];
         ArrayList<Integer> values = new ArrayList<>();
         for (int i = 0; i < array.length(); i++) {
             int value = array.optInt(i, Integer.MIN_VALUE);
             if (value == Integer.MIN_VALUE) continue;
             values.add(value);
         }
-        if (values.isEmpty()) return new int[]{fallback};
+        int[] result = new int[values.size()];
+        for (int i = 0; i < values.size(); i++) result[i] = values.get(i);
+        return result;
+    }
+
+    @NonNull
+    private static int[] toFixedSlots(@NonNull int[] codes, int fallback) {
+        int[] result = new int[MAX_ACTION_SLOTS];
+        int write = 0;
+        if (codes.length == MAX_ACTION_SLOTS) {
+            for (int i = 0; i < MAX_ACTION_SLOTS; i++) result[i] = codes[i];
+            return result;
+        }
+        for (int code : codes) {
+            if (write >= MAX_ACTION_SLOTS) break;
+            if (code == 0) continue;
+            result[write++] = code;
+        }
+        if (write == 0 && fallback > 0) result[0] = fallback;
+        return result;
+    }
+
+    @NonNull
+    private static int[] activeCodesFromSlots(@NonNull int[] slots) {
+        ArrayList<Integer> values = new ArrayList<>();
+        for (int slot = 0; slot < Math.min(MAX_ACTION_SLOTS, slots.length); slot++) {
+            int value = slots[slot];
+            if (value != 0) values.add(value);
+        }
         int[] result = new int[values.size()];
         for (int i = 0; i < values.size(); i++) result[i] = values.get(i);
         return result;
@@ -370,7 +453,7 @@ public final class TouchControlData {
             default:
                 data.action = TouchControlActions.KEY;
                 data.keyCode = key;
-                data.keyCodes = allKeys;
+                data.setKeyCodes(allKeys);
         }
     }
 }

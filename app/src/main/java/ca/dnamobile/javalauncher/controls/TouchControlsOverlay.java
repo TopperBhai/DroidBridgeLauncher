@@ -14,9 +14,12 @@ package ca.dnamobile.javalauncher.controls;
 
 import android.app.AlertDialog;
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.GradientDrawable;
@@ -25,11 +28,13 @@ import android.text.Editable;
 import android.text.InputType;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.TextWatcher;
 import android.util.DisplayMetrics;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.PointerIcon;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -54,10 +59,13 @@ import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.util.UUID;
+import java.util.Locale;
 
 import org.lwjgl.glfw.CallbackBridge;
 
 import ca.dnamobile.javalauncher.feature.log.Logging;
+import ca.dnamobile.javalauncher.input.GameCursorOverlay;
+import ca.dnamobile.javalauncher.utils.path.PathManager;
 import net.kdt.pojavlaunch.MinecraftGLSurface;
 
 /**
@@ -80,6 +88,37 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     @Nullable private View passthroughTarget;
 
     /**
+     * Optional explicit Minecraft options.txt for the active instance.
+     * If GameActivity does not set this, the overlay falls back to the current
+     * PathManager.DIR_MINECRAFT_HOME/options.txt so the hotbar hitbox can still
+     * follow Minecraft GUI-scale changes in game.
+     */
+    @Nullable private File minecraftOptionsFile;
+    @Nullable private File cachedMinecraftOptionsFile;
+    private long lastMinecraftOptionsResolveAtMs;
+    private static final long OPTIONS_FILE_RESOLVE_THROTTLE_MS = 1000L;
+
+    /**
+     * Virtual cursor is only a GUI/menu cursor. While Minecraft has grabbed the
+     * mouse for normal gameplay, the launcher must not draw or route the fake
+     * cursor or it will fight camera movement. Keep this cursor separate from
+     * CallbackBridge.mouseX/mouseY because those coordinates are also used by
+     * grabbed camera-look deltas while the player is moving around the world.
+     */
+    private boolean lastVirtualMousePreference;
+    private boolean lastKnownMouseGrabbed = true;
+    private boolean androidPointerIconHidden;
+    private boolean pointerIconReapplyPending;
+    @Nullable private PointerIcon transparentPointerIcon;
+    private boolean virtualCursorInitialized;
+    private float virtualCursorBridgeX;
+    private float virtualCursorBridgeY;
+    @Nullable private Bitmap virtualCursorBitmap;
+    @NonNull private String loadedVirtualCursorStyle = "";
+    @Nullable private String loadedVirtualCursorCustomPath;
+    private int loadedVirtualCursorSizePercent = -1;
+
+    /**
      * Runtime multi-touch routing:
      * - pointers that begin on a touch button are owned by that button
      * - the first pointer that begins on empty space is forwarded to MinecraftGLSurface as
@@ -95,11 +134,10 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
      */
     private static final int NO_POINTER_ID = -1;
     private static final int MOUSE_BUTTON_LEFT = 0;
-    private static final int GLFW_KEY_Q = 81;
+    private static final int MOUSE_BUTTON_RIGHT = 1;
 
     private final Handler gestureHandler = new Handler(Looper.getMainLooper());
     private final int cameraTouchSlop;
-    private final int doubleTapSlop;
 
     /** Pointer ID for the right-thumb look/attack stream. */
     private int cameraPointerId = NO_POINTER_ID;
@@ -111,10 +149,6 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     private boolean cameraLongPressAttackActive;
     @Nullable private Runnable cameraLongPressRunnable;
 
-    private long lastTapToDropUptimeMs;
-    private float lastTapToDropX;
-    private float lastTapToDropY;
-
     /** GUI fallback: used only when Minecraft is not grabbing the mouse. */
     private int passthroughPointerId = NO_POINTER_ID;
     private long passthroughDownTime;
@@ -122,8 +156,8 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     /**
      * Menu fake-mouse routing. When the virtual mouse preference is enabled,
      * empty-space touches in Minecraft GUIs act like a small touchpad instead
-     * of absolute touchscreen clicks. This keeps the pointer offset from the
-     * finger like Pojav/Zalith-style virtual mouse controls.
+     * of absolute touchscreen clicks. The cursor itself is drawn by this overlay
+     * so devices do not depend on Android/Minecraft cursor visibility.
      */
     private int virtualMousePointerId = NO_POINTER_ID;
     private float virtualMouseDownX;
@@ -142,6 +176,11 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     private final Paint hotbarDebugStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint hotbarDebugSlotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint hotbarDebugTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    private final Paint virtualCursorFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint virtualCursorStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint virtualCursorShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Path virtualCursorPath = new Path();
 
     public TouchControlsOverlay(@NonNull Context context) {
         super(context);
@@ -169,13 +208,47 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         hotbarDebugTextPaint.setTextSize(12f * getResources().getDisplayMetrics().scaledDensity);
         hotbarDebugTextPaint.setShadowLayer(3f, 0f, 0f, Color.BLACK);
 
-        ViewConfiguration configuration = ViewConfiguration.get(context);
-        cameraTouchSlop = configuration.getScaledTouchSlop();
-        doubleTapSlop = configuration.getScaledDoubleTapSlop();
+        virtualCursorFillPaint.setColor(Color.WHITE);
+        virtualCursorFillPaint.setStyle(Paint.Style.STROKE);
+        virtualCursorFillPaint.setStrokeJoin(Paint.Join.ROUND);
+        virtualCursorFillPaint.setStrokeCap(Paint.Cap.ROUND);
+        virtualCursorFillPaint.setStrokeWidth(2.0f * getResources().getDisplayMetrics().density);
+
+        virtualCursorStrokePaint.setColor(0xFF111111);
+        virtualCursorStrokePaint.setStyle(Paint.Style.STROKE);
+        virtualCursorStrokePaint.setStrokeJoin(Paint.Join.ROUND);
+        virtualCursorStrokePaint.setStrokeCap(Paint.Cap.ROUND);
+        virtualCursorStrokePaint.setStrokeWidth(4.2f * getResources().getDisplayMetrics().density);
+
+        // Kept for binary/source compatibility with the previous patch, but the
+        // cursor no longer uses a drop shadow. The old shadow was what made the
+        // pointer look like two mice stacked on top of each other.
+        virtualCursorShadowPaint.setColor(Color.TRANSPARENT);
+        virtualCursorShadowPaint.setStyle(Paint.Style.STROKE);
+        virtualCursorShadowPaint.setStrokeJoin(Paint.Join.ROUND);
+        virtualCursorShadowPaint.setStrokeCap(Paint.Cap.ROUND);
+        virtualCursorShadowPaint.setStrokeWidth(0f);
+
+        reloadVirtualCursorBitmapIfNeeded(true);
+
+        cameraTouchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
     }
 
     public void setPassthroughTarget(@Nullable View passthroughTarget) {
         this.passthroughTarget = passthroughTarget;
+        boolean shouldHidePointer = shouldDrawLauncherVirtualCursor();
+        androidPointerIconHidden = !shouldHidePointer;
+        applyAndroidPointerIconPolicy(shouldHidePointer, true);
+    }
+
+    public void setMinecraftOptionsFile(@Nullable File minecraftOptionsFile) {
+        this.minecraftOptionsFile = minecraftOptionsFile;
+        this.cachedMinecraftOptionsFile = minecraftOptionsFile != null && minecraftOptionsFile.isFile()
+                ? minecraftOptionsFile
+                : null;
+        this.lastMinecraftOptionsResolveAtMs = 0L;
+        MinecraftGuiScaleResolver.clearCache();
+        invalidate();
     }
 
     public void setAppMenuListener(@Nullable AppMenuListener appMenuListener) {
@@ -293,29 +366,290 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
         rebuildWhenSized();
+        post(() -> applyAndroidPointerIconPolicy(shouldUseLauncherVirtualCursorNoPolicy(), true));
     }
 
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
         if (w != oldw || h != oldh) rebuildWhenSized();
+        post(() -> applyAndroidPointerIconPolicy(shouldUseLauncherVirtualCursorNoPolicy(), true));
     }
 
     @Override
     protected void onDraw(@NonNull Canvas canvas) {
         super.onDraw(canvas);
+        drawVirtualMouseCursor(canvas);
         drawHotbarHitboxDebug(canvas);
+    }
+
+    private void drawVirtualMouseCursor(@NonNull Canvas canvas) {
+        // GameCursorOverlay is now the single visible menu cursor renderer for
+        // both controller cursor mode and touch virtual-mouse mode. If it is
+        // attached, do not draw a second cursor from this overlay; otherwise
+        // Redmagic/handheld devices show the old arrow or a doubled cursor.
+        // Keep the Android pointer hide policy active while the virtual mouse
+        // is in GUI/menu mode, but leave the pixels to GameCursorOverlay.
+        if (hasGameCursorOverlayInViewTree()) {
+            applyAndroidPointerIconPolicy(shouldUseLauncherVirtualCursorNoPolicy());
+            return;
+        }
+
+        if (!shouldDrawLauncherVirtualCursor()) return;
+
+        reloadVirtualCursorBitmapIfNeeded(false);
+        ensureVirtualMouseCursorInBounds();
+
+        float cursorX = bridgeCursorToViewX(virtualCursorBridgeX);
+        float cursorY = bridgeCursorToViewY(virtualCursorBridgeY);
+        if (Float.isNaN(cursorX) || Float.isInfinite(cursorX)) cursorX = getWidth() / 2f;
+        if (Float.isNaN(cursorY) || Float.isInfinite(cursorY)) cursorY = getHeight() / 2f;
+
+        cursorX = clamp(cursorX, 0f, Math.max(0f, getWidth() - 1f));
+        cursorY = clamp(cursorY, 0f, Math.max(0f, getHeight() - 1f));
+
+        Bitmap bitmap = virtualCursorBitmap;
+        if (bitmap != null && !bitmap.isRecycled()) {
+            float size = 26f
+                    * getResources().getDisplayMetrics().density
+                    * ControlsPreferences.getMouseCursorSizePercent(getContext())
+                    / 100f;
+            RectF dst = new RectF(
+                    cursorX - (size / 2f),
+                    cursorY - (size / 2f),
+                    cursorX + (size / 2f),
+                    cursorY + (size / 2f)
+            );
+            canvas.drawBitmap(bitmap, null, dst, null);
+            return;
+        }
+
+        float density = getResources().getDisplayMetrics().density;
+        float arm = 13f * density;
+        float gap = 4f * density;
+        float ringRadius = 7.5f * density;
+
+        // Mojo-style virtual mouse: a clean crosshair instead of a large arrow.
+        // Draw black first as an outline, then white on top. No offset shadow,
+        // because the old shadow looked like a second cursor on some screens.
+        drawVirtualCursorCrosshair(canvas, cursorX, cursorY, arm, gap, ringRadius, virtualCursorStrokePaint);
+        drawVirtualCursorCrosshair(canvas, cursorX, cursorY, arm, gap, ringRadius, virtualCursorFillPaint);
+    }
+
+    private void drawVirtualCursorCrosshair(
+            @NonNull Canvas canvas,
+            float x,
+            float y,
+            float arm,
+            float gap,
+            float ringRadius,
+            @NonNull Paint paint
+    ) {
+        canvas.drawLine(x - arm, y, x - gap, y, paint);
+        canvas.drawLine(x + gap, y, x + arm, y, paint);
+        canvas.drawLine(x, y - arm, x, y - gap, paint);
+        canvas.drawLine(x, y + gap, x, y + arm, paint);
+        canvas.drawCircle(x, y, ringRadius, paint);
+    }
+
+    private void reloadVirtualCursorBitmapIfNeeded(boolean force) {
+        String style = ControlsPreferences.getMouseCursorStyle(getContext());
+        String customPath = ControlsPreferences.getCustomMouseCursorPath(getContext());
+        int sizePercent = ControlsPreferences.getMouseCursorSizePercent(getContext());
+
+        boolean sameStyle = style.equals(loadedVirtualCursorStyle);
+        boolean samePath = customPath == null
+                ? loadedVirtualCursorCustomPath == null
+                : customPath.equals(loadedVirtualCursorCustomPath);
+        boolean sameSize = sizePercent == loadedVirtualCursorSizePercent;
+        if (!force && sameStyle && samePath && sameSize) return;
+
+        loadedVirtualCursorStyle = style;
+        loadedVirtualCursorCustomPath = customPath;
+        loadedVirtualCursorSizePercent = sizePercent;
+        virtualCursorBitmap = loadVirtualCursorBitmap(getContext(), style, customPath);
+        postInvalidateOnAnimation();
+    }
+
+    @Nullable
+    private Bitmap loadVirtualCursorBitmap(
+            @NonNull Context context,
+            @NonNull String style,
+            @Nullable String customPath
+    ) {
+        if (ControlsPreferences.MOUSE_CURSOR_STYLE_CUSTOM.equals(style) && customPath != null) {
+            try {
+                File file = new File(customPath);
+                if (file.isFile() && file.length() > 0L) {
+                    Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
+                    if (bitmap != null) return bitmap;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        try {
+            int id = context.getResources().getIdentifier(
+                    ControlsPreferences.getMouseCursorResourceName(style),
+                    "drawable",
+                    context.getPackageName()
+            );
+            return id != 0 ? BitmapFactory.decodeResource(context.getResources(), id) : null;
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to load virtual mouse cursor image", throwable);
+            return null;
+        }
+    }
+
+    private void applyAndroidPointerIconPolicy(boolean hidePointerIcon) {
+        applyAndroidPointerIconPolicy(hidePointerIcon, false);
+    }
+
+    private void applyAndroidPointerIconPolicy(boolean hidePointerIcon, boolean force) {
+        applyAndroidPointerIconPolicy(hidePointerIcon, force, true);
+    }
+
+    private void applyAndroidPointerIconPolicy(boolean hidePointerIcon, boolean force, boolean scheduleReapply) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return;
+
+        // When hiding the system/native pointer, do not skip re-applying just
+        // because our last request was also hidden. Several devices reset the
+        // pointer icon when the focused child view changes between the overlay,
+        // TextureView, SurfaceView, and MinecraftGLSurface. Re-applying to the
+        // entire view tree is what prevents the native arrow from sitting on top
+        // of the launcher-drawn Mojo-style crosshair.
+        if (!hidePointerIcon && !force && !androidPointerIconHidden) return;
+
+        try {
+            PointerIcon icon = hidePointerIcon
+                    ? invisiblePointerIcon()
+                    : PointerIcon.getSystemIcon(getContext(), PointerIcon.TYPE_DEFAULT);
+
+            applyPointerIconToViewTree(getRootView(), icon);
+            applyPointerIconToViewTree(this, icon);
+            applyPointerIconToViewTree(passthroughTarget, icon);
+
+            ViewParent parent = getParent();
+            if (parent instanceof View) {
+                applyPointerIconToViewTree((View) parent, icon);
+            }
+
+            androidPointerIconHidden = hidePointerIcon;
+            if (hidePointerIcon && scheduleReapply) schedulePointerIconReapply();
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to update Android pointer icon", throwable);
+        }
+    }
+
+    @NonNull
+    private PointerIcon invisiblePointerIcon() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                if (transparentPointerIcon == null) {
+                    Bitmap transparent = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+                    transparentPointerIcon = PointerIcon.create(transparent, 0f, 0f);
+                }
+                if (transparentPointerIcon != null) return transparentPointerIcon;
+            } catch (Throwable ignored) {
+            }
+        }
+        return PointerIcon.getSystemIcon(getContext(), PointerIcon.TYPE_NULL);
+    }
+
+    private void applyPointerIconToViewTree(@Nullable View view, @NonNull PointerIcon icon) {
+        if (view == null) return;
+
+        try {
+            view.setPointerIcon(icon);
+        } catch (Throwable ignored) {
+        }
+
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                applyPointerIconToViewTree(group.getChildAt(i), icon);
+            }
+        }
+    }
+
+    private void schedulePointerIconReapply() {
+        if (pointerIconReapplyPending) return;
+        pointerIconReapplyPending = true;
+        postDelayed(() -> reapplyHiddenPointerIconIfNeeded(false), 90L);
+        postDelayed(() -> reapplyHiddenPointerIconIfNeeded(true), 320L);
+    }
+
+    private void reapplyHiddenPointerIconIfNeeded(boolean finalPass) {
+        if (shouldUseLauncherVirtualCursorNoPolicy()) {
+            applyAndroidPointerIconPolicy(true, true, false);
+        }
+        if (finalPass) pointerIconReapplyPending = false;
+    }
+
+    private boolean shouldUseLauncherVirtualCursorNoPolicy() {
+        return !editMode
+                && ControlsPreferences.isVirtualMouseEnabled(getContext())
+                && !updateMouseGrabState();
+    }
+
+    private boolean shouldDrawLauncherVirtualCursor() {
+        if (editMode) {
+            applyAndroidPointerIconPolicy(false);
+            return false;
+        }
+
+        boolean enabled = ControlsPreferences.isVirtualMouseEnabled(getContext());
+        boolean grabbed = updateMouseGrabState();
+        updateVirtualMousePreferenceState(enabled, grabbed);
+
+        boolean draw = enabled && !grabbed;
+        applyAndroidPointerIconPolicy(draw);
+        return draw;
+    }
+
+    private void updateVirtualMousePreferenceState(boolean enabled, boolean grabbed) {
+        if (enabled == lastVirtualMousePreference) return;
+        lastVirtualMousePreference = enabled;
+        if (enabled) {
+            if (!grabbed) resetVirtualMouseCursorToCenter(true);
+            else virtualCursorInitialized = false;
+        } else {
+            virtualCursorInitialized = false;
+            applyAndroidPointerIconPolicy(false);
+        }
+    }
+
+    /**
+     * Returns the current grab state and resets the fake cursor exactly once when
+     * Minecraft opens a GUI. This prevents camera movement during normal gameplay
+     * from dragging the menu cursor away from the center before the menu appears.
+     */
+    private boolean updateMouseGrabState() {
+        boolean grabbed = isMouseGrabbed();
+        if (grabbed != lastKnownMouseGrabbed) {
+            lastKnownMouseGrabbed = grabbed;
+            if (!grabbed && ControlsPreferences.isVirtualMouseEnabled(getContext())) {
+                resetVirtualMouseCursorToCenter(true);
+            } else if (grabbed) {
+                cancelVirtualMousePointer();
+                applyAndroidPointerIconPolicy(false);
+            }
+            postInvalidateOnAnimation();
+        }
+        return grabbed;
     }
 
     private void drawHotbarHitboxDebug(@NonNull Canvas canvas) {
         if (!ControlsPreferences.isHotbarHitboxDebugEnabled(getContext())) return;
 
+        File optionsFile = resolveMinecraftOptionsFile();
         TouchHotbarHitbox.Result hitbox = TouchHotbarHitbox.calculate(
                 getContext(),
+                optionsFile,
                 getWidth(),
                 getHeight(),
-                CallbackBridge.physicalWidth,
-                CallbackBridge.physicalHeight
+                resolveGameBufferWidth(),
+                resolveGameBufferHeight()
         );
 
         RectF touchBounds = hitbox.touchBounds;
@@ -335,11 +669,28 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         }
 
         canvas.drawText(
-                "Hotbar hitbox  scale=" + hitbox.scale
-                        + "  xOff=" + ControlsPreferences.getHotbarXOffsetDp(getContext())
-                        + "dp  yOff=" + ControlsPreferences.getHotbarYOffsetDp(getContext()) + "dp",
+                "Hotbar hitbox  scale=" + formatScale(hitbox.scale)
+                        + "  src=" + hitbox.scaleSourceLabel()
+                        + "  mcGui=" + hitbox.minecraftGuiScale
+                        + "  override=" + hitbox.overrideScale,
                 hotbarBounds.centerX(),
                 textY,
+                hotbarDebugTextPaint
+        );
+
+        canvas.drawText(
+                "render=" + formatScale(hitbox.renderScaleX) + "x/" + formatScale(hitbox.renderScaleY)
+                        + "  res=" + hitbox.resolutionScalePercent + "%"
+                        + "  buffer=" + Math.round(hitbox.gameBufferWidth) + "x" + Math.round(hitbox.gameBufferHeight),
+                hotbarBounds.centerX(),
+                textY + hotbarDebugTextPaint.getTextSize() + (3f * getResources().getDisplayMetrics().density),
+                hotbarDebugTextPaint
+        );
+
+        canvas.drawText(
+                "options=" + debugOptionsFileName(optionsFile),
+                hotbarBounds.centerX(),
+                textY + (hotbarDebugTextPaint.getTextSize() * 2f) + (6f * getResources().getDisplayMetrics().density),
                 hotbarDebugTextPaint
         );
 
@@ -577,6 +928,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         String originalAction = data.action;
         int originalKeyCode = data.keyCode;
         int[] originalKeyCodes = data.normalizedKeyCodes().clone();
+        int[] originalKeySlots = data.normalizedKeySlots().clone();
         int originalMouseButton = data.mouseButton;
         int originalScrollY = data.scrollY;
         float originalX = data.x;
@@ -645,34 +997,75 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         addSpinnerRow(layout, "Binding", bindingSpinner);
         final TouchInputBinding.Option[][] currentOptions = new TouchInputBinding.Option[1][];
 
-        // Keep the raw numeric key list internally for saving, but do not show it
-        // as the main UI. Users should see friendly names like "W + Left Ctrl",
-        // not GLFW key IDs like "87, 341".
-        EditText keyCodes = textField(context, "Internal key IDs", joinKeyCodes(data.normalizedKeyCodes()), false);
+        // Keep the raw numeric key slot list internally for saving, but do not show it
+        // as the main UI. Users should see friendly names like "Position 0: Left Shift",
+        // not GLFW key IDs like "340, 89".
+        EditText keyCodes = textField(context, "Internal key slots", joinKeyCodes(data.normalizedKeySlots()), false);
         keyCodes.setVisibility(GONE);
         layout.addView(keyCodes, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0
         ));
 
-        TextView boundKeys = valueLabel(context, "Bound keys: " + TouchInputBinding.friendlyKeyCombo(data.normalizedKeyCodes()));
+        TextView boundKeys = valueLabel(context, "Bound buttons: " + TouchInputBinding.friendlyKeyCombo(data.normalizedKeyCodes()));
         layout.addView(boundKeys);
 
-        Button addSelectedBinding = new Button(context);
-        addSelectedBinding.setText("Add selected key to this button");
-        addSelectedBinding.setAllCaps(false);
-        layout.addView(addSelectedBinding, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        ));
+        TextView keySlotHint = valueLabel(context, "Set up to 4 button positions. Each position can be a keyboard key, mouse click, or wheel action and can be changed or cleared without touching the others.");
+        layout.addView(keySlotHint);
 
-        Button clearSelectedBindings = new Button(context);
-        clearSelectedBindings.setText("Clear bound keys");
-        clearSelectedBindings.setAllCaps(false);
-        layout.addView(clearSelectedBindings, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        ));
+        TouchInputBinding.Option[] keyOptions = TouchInputBinding.optionsForAction(TouchControlActions.KEY);
+        Spinner[] keySlotSpinners = new Spinner[TouchControlData.MAX_ACTION_SLOTS];
+        LinearLayout[] keySlotRows = new LinearLayout[TouchControlData.MAX_ACTION_SLOTS];
+        int[] startingKeySlots = data.normalizedKeySlots();
+        for (int slot = 0; slot < TouchControlData.MAX_ACTION_SLOTS; slot++) {
+            LinearLayout slotRow = new LinearLayout(context);
+            slotRow.setOrientation(LinearLayout.HORIZONTAL);
+            slotRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            slotRow.setPadding(0, dp(2f), 0, dp(2f));
+
+            TextView slotLabel = new TextView(context);
+            slotLabel.setText("Position " + slot);
+            slotLabel.setTextColor(0xFFE0E0E0);
+            slotLabel.setTextSize(13f);
+            slotRow.addView(slotLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.75f));
+
+            Spinner slotSpinner = new Spinner(context);
+            ArrayAdapter<String> slotAdapter = new ArrayAdapter<>(context, android.R.layout.simple_spinner_item, TouchInputBinding.optionLabels(keyOptions));
+            slotAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+            slotSpinner.setAdapter(slotAdapter);
+            int slotValue = slot < startingKeySlots.length ? startingKeySlots[slot] : 0;
+            slotSpinner.setSelection(TouchInputBinding.selectedKeyOptionIndex(slotValue), false);
+            slotRow.addView(slotSpinner, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.45f));
+
+            Button clearSlot = new Button(context);
+            clearSlot.setText("Clear");
+            clearSlot.setAllCaps(false);
+            slotRow.addView(clearSlot, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.65f));
+
+            final int slotIndex = slot;
+            clearSlot.setOnClickListener(v -> {
+                keySlotSpinners[slotIndex].setSelection(TouchInputBinding.selectedKeyOptionIndex(0));
+                updateKeySlotSummary(keyCodes, boundKeys, keySlotSpinners, keyOptions);
+            });
+            slotSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                @Override
+                public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                    updateKeySlotSummary(keyCodes, boundKeys, keySlotSpinners, keyOptions);
+                }
+
+                @Override
+                public void onNothingSelected(AdapterView<?> parent) {
+                }
+            });
+
+            layout.addView(slotRow, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            ));
+            keySlotSpinners[slot] = slotSpinner;
+            keySlotRows[slot] = slotRow;
+        }
+        updateKeySlotSummary(keyCodes, boundKeys, keySlotSpinners, keyOptions);
 
         AdapterView.OnItemSelectedListener actionListener = new AdapterView.OnItemSelectedListener() {
             @Override
@@ -694,11 +1087,13 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                         ? TouchInputBinding.selectedOptionIndex(action, data)
                         : 0;
                 bindingSpinner.setSelection(selected, false);
-                bindingSpinner.setEnabled(options.length > 1);
+                bindingSpinner.setEnabled(!keyAction && options.length > 1);
                 keyCodes.setVisibility(GONE);
                 boundKeys.setVisibility(keyAction ? VISIBLE : GONE);
-                addSelectedBinding.setVisibility(keyAction ? VISIBLE : GONE);
-                clearSelectedBindings.setVisibility(keyAction ? VISIBLE : GONE);
+                keySlotHint.setVisibility(keyAction ? VISIBLE : GONE);
+                for (LinearLayout slotRow : keySlotRows) {
+                    if (slotRow != null) slotRow.setVisibility(keyAction ? VISIBLE : GONE);
+                }
             }
 
             @Override
@@ -707,22 +1102,6 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         };
         actionSpinner.setOnItemSelectedListener(actionListener);
         actionListener.onItemSelected(actionSpinner, actionSpinner, actionSpinner.getSelectedItemPosition(), 0L);
-
-        addSelectedBinding.setOnClickListener(v -> {
-            TouchInputBinding.Option[] options = currentOptions[0] != null ? currentOptions[0] : TouchInputBinding.optionsForAction(TouchControlActions.KEY);
-            if (options.length == 0) return;
-            int index = Math.max(0, Math.min(bindingSpinner.getSelectedItemPosition(), options.length - 1));
-            int value = options[index].value;
-            keyCodes.setText(appendKeyCodeText(keyCodes.getText() == null ? "" : keyCodes.getText().toString(), value));
-            boundKeys.setText("Bound keys: " + TouchInputBinding.friendlyKeyCombo(
-                    parseKeyCodes(keyCodes.getText() == null ? "" : keyCodes.getText().toString(), value)
-            ));
-        });
-
-        clearSelectedBindings.setOnClickListener(v -> {
-            keyCodes.setText("");
-            boundKeys.setText("Bound keys: No keys bound");
-        });
 
         addSectionHeader(layout, "Position", "X/Y use the same layout units as Width/Height.");
         EditText x = textField(context, "X position", String.valueOf(Math.round(initialLayoutX)), true);
@@ -790,7 +1169,10 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         virtualMouse.setText("Show virtual cursor");
         virtualMouse.setTextColor(0xFFE0E0E0);
         virtualMouse.setChecked(ControlsPreferences.isVirtualMouseEnabled(context));
-        virtualMouse.setOnCheckedChangeListener((buttonView, isChecked) -> ControlsPreferences.setVirtualMouseEnabled(context, isChecked));
+        virtualMouse.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            ControlsPreferences.setVirtualMouseEnabled(context, isChecked);
+            postInvalidateOnAnimation();
+        });
         layout.addView(virtualMouse);
 
         Button copyButton = new Button(context);
@@ -931,8 +1313,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 TouchInputBinding.applyOption(data, action, option);
 
                 if (TouchControlActions.KEY.equals(action)) {
-                    int[] parsedKeys = parseKeyCodes(keyCodes.getText() == null ? "" : keyCodes.getText().toString(), option.value);
-                    data.setKeyCodes(parsedKeys);
+                    data.setKeySlots(readKeySlotsFromSpinners(keySlotSpinners, keyOptions));
                 }
 
                 // Preserve exactly what the user typed in the Label field.
@@ -970,6 +1351,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 data.action = originalAction;
                 data.keyCode = originalKeyCode;
                 data.keyCodes = originalKeyCodes;
+                data.keySlots = originalKeySlots;
                 data.mouseButton = originalMouseButton;
                 data.scrollY = originalScrollY;
                 data.x = originalX;
@@ -1311,6 +1693,49 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         return drawable;
     }
 
+
+    @NonNull
+    private int[] readKeySlotsFromSpinners(
+            @NonNull Spinner[] spinners,
+            @NonNull TouchInputBinding.Option[] options
+    ) {
+        int[] slots = new int[TouchControlData.MAX_ACTION_SLOTS];
+        for (int slot = 0; slot < slots.length && slot < spinners.length; slot++) {
+            Spinner spinner = spinners[slot];
+            if (spinner == null || options.length == 0) {
+                slots[slot] = 0;
+                continue;
+            }
+            int index = Math.max(0, Math.min(spinner.getSelectedItemPosition(), options.length - 1));
+            slots[slot] = options[index].value;
+        }
+        return slots;
+    }
+
+    private void updateKeySlotSummary(
+            @NonNull EditText hiddenKeySlots,
+            @NonNull TextView boundKeys,
+            @NonNull Spinner[] spinners,
+            @NonNull TouchInputBinding.Option[] options
+    ) {
+        int[] slots = readKeySlotsFromSpinners(spinners, options);
+        hiddenKeySlots.setText(joinKeyCodes(slots));
+        java.util.ArrayList<Integer> active = new java.util.ArrayList<>();
+        StringBuilder detail = new StringBuilder();
+        for (int slot = 0; slot < slots.length; slot++) {
+            int value = slots[slot];
+            if (value == 0) continue;
+            active.add(value);
+            if (detail.length() > 0) detail.append("  •  ");
+            detail.append(slot).append(": ").append(TouchInputBinding.labelForKeyCode(value));
+        }
+        int[] activeCodes = new int[active.size()];
+        for (int i = 0; i < active.size(); i++) activeCodes[i] = active.get(i);
+        boundKeys.setText(detail.length() == 0
+                ? "Bound buttons: No bindings"
+                : "Bound buttons: " + TouchInputBinding.friendlyKeyCombo(activeCodes) + "\nSlots: " + detail);
+    }
+
     private int[] parseKeyCodes(@NonNull String text, int fallback) {
         String[] parts = text.split("[,\\s]+");
         java.util.ArrayList<Integer> values = new java.util.ArrayList<>();
@@ -1420,7 +1845,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         int pointerId = event.getPointerId(pointerIndex);
         float x = event.getX(pointerIndex);
         float y = event.getY(pointerIndex);
-        boolean grabbed = isMouseGrabbed();
+        boolean grabbed = updateMouseGrabState();
 
         if (grabbed) {
             // Virtual cursor visibility must never change touch routing.
@@ -1452,7 +1877,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             return hasActiveTouchRoute();
         }
 
-        if (ControlsPreferences.isVirtualMouseEnabled(getContext())) {
+        if (!grabbed && ControlsPreferences.isVirtualMouseEnabled(getContext())) {
             if (virtualMousePointerId == NO_POINTER_ID) {
                 startVirtualMousePointer(event, pointerIndex, pointerId);
                 return true;
@@ -1533,6 +1958,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         }
     }
 
+
     private void startVirtualMousePointer(@NonNull MotionEvent event, int pointerIndex, int pointerId) {
         if (pointerIndex < 0 || pointerIndex >= event.getPointerCount()) return;
 
@@ -1543,10 +1969,16 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         virtualMouseLastY = virtualMouseDownY;
         virtualMouseMovedPastSlop = false;
         ensureVirtualMouseCursorInBounds();
+        sendVirtualMouseCursorPosition();
+        postInvalidateOnAnimation();
     }
 
     private void dispatchActiveVirtualMousePointer(@NonNull MotionEvent event) {
         if (virtualMousePointerId == NO_POINTER_ID) return;
+        if (updateMouseGrabState()) {
+            cancelVirtualMousePointer();
+            return;
+        }
 
         int pointerIndex = event.findPointerIndex(virtualMousePointerId);
         if (pointerIndex < 0) return;
@@ -1565,7 +1997,10 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             virtualMouseMovedPastSlop = true;
         }
 
-        if (dx == 0f && dy == 0f) return;
+        if (dx == 0f && dy == 0f) {
+            postInvalidateOnAnimation();
+            return;
+        }
         sendVirtualMouseDelta(dx, dy);
     }
 
@@ -1575,14 +2010,15 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         }
 
         if (!cancelled && !virtualMouseMovedPastSlop) {
-            // A quick tap in fake-mouse mode clicks at the virtual cursor, not at
-            // the finger position. For drag/click-hold, use a normal Mouse Left
-            // touch button while moving the fake mouse with another finger.
+            // Quick tap in fake-mouse mode clicks at the visible cursor, not at
+            // the finger position. Use a normal Mouse Left button for click-hold.
+            sendVirtualMouseCursorPosition();
             sendLeftMouse(true);
             sendLeftMouse(false);
         }
 
         cancelVirtualMousePointer();
+        postInvalidateOnAnimation();
     }
 
     private void cancelVirtualMousePointer() {
@@ -1637,15 +2073,15 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
         cancelCameraLongPressAttack(cancelled);
 
-        boolean gesturesEnabled = ControlsPreferences.isMinecraftTouchGesturesEnabled(getContext());
-        if (!cancelled && gesturesEnabled && cameraLongPressAttackActive) {
+        if (!cancelled && cameraLongPressAttackActive) {
             sendLeftMouse(false);
-        } else if (!cancelled && gesturesEnabled && !cameraMovedPastSlop) {
-            if (!handleDoubleTapToDrop(event.getX(pointerIndex), event.getY(pointerIndex), event.getEventTime())) {
-                // Quick tap on the look area acts like the attack button.
-                sendLeftMouse(true);
-                sendLeftMouse(false);
-            }
+        } else if (!cancelled
+                && !cameraMovedPastSlop
+                && ControlsPreferences.isMinecraftTouchGesturesEnabled(getContext())) {
+            // Quick tap on the look area should use/place, not attack.
+            // Long press remains left mouse for digging / punching.
+            sendRightMouse(true);
+            sendRightMouse(false);
         }
 
         cameraLongPressAttackActive = false;
@@ -1665,7 +2101,6 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     }
 
     private void scheduleCameraLongPressAttack() {
-        if (!ControlsPreferences.isMinecraftTouchGesturesEnabled(getContext())) return;
         cancelCameraLongPressAttack(false);
         cameraLongPressRunnable = () -> {
             if (cameraPointerId == NO_POINTER_ID || cameraMovedPastSlop || cameraLongPressAttackActive) return;
@@ -1673,32 +2108,6 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             sendLeftMouse(true);
         };
         gestureHandler.postDelayed(cameraLongPressRunnable, ViewConfiguration.getLongPressTimeout());
-    }
-
-    private boolean handleDoubleTapToDrop(float x, float y, long eventTimeMs) {
-        if (!ControlsPreferences.isDoubleTapToDropEnabled(getContext())) {
-            lastTapToDropUptimeMs = 0L;
-            return false;
-        }
-
-        long lastTime = lastTapToDropUptimeMs;
-        long elapsed = lastTime <= 0L ? Long.MAX_VALUE : eventTimeMs - lastTime;
-        float dx = x - lastTapToDropX;
-        float dy = y - lastTapToDropY;
-        float maxDistance = Math.max(cameraTouchSlop, doubleTapSlop);
-        boolean doubleTap = elapsed >= 0L
-                && elapsed <= ViewConfiguration.getDoubleTapTimeout()
-                && ((dx * dx) + (dy * dy)) <= (maxDistance * maxDistance);
-
-        lastTapToDropUptimeMs = eventTimeMs;
-        lastTapToDropX = x;
-        lastTapToDropY = y;
-
-        if (!doubleTap) return false;
-
-        lastTapToDropUptimeMs = 0L;
-        sendKeyTap(GLFW_KEY_Q);
-        return true;
     }
 
     private void cancelCameraLongPressAttack(boolean cancelActivePress) {
@@ -1739,13 +2148,164 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     private int hotbarSlotForTouch(float x, float y) {
         return TouchHotbarHitbox.slotForTouch(
                 getContext(),
+                resolveMinecraftOptionsFile(),
                 getWidth(),
                 getHeight(),
-                CallbackBridge.physicalWidth,
-                CallbackBridge.physicalHeight,
+                resolveGameBufferWidth(),
+                resolveGameBufferHeight(),
                 x,
                 y
         );
+    }
+
+    @Nullable
+    private File resolveMinecraftOptionsFile() {
+        if (minecraftOptionsFile != null && minecraftOptionsFile.isFile()) {
+            return minecraftOptionsFile;
+        }
+
+        long now = SystemClock.uptimeMillis();
+        if (cachedMinecraftOptionsFile != null
+                && cachedMinecraftOptionsFile.isFile()
+                && now - lastMinecraftOptionsResolveAtMs < OPTIONS_FILE_RESOLVE_THROTTLE_MS) {
+            return cachedMinecraftOptionsFile;
+        }
+
+        File resolved = findBestMinecraftOptionsFile();
+        cachedMinecraftOptionsFile = resolved;
+        lastMinecraftOptionsResolveAtMs = now;
+        return resolved;
+    }
+
+    @Nullable
+    private File findBestMinecraftOptionsFile() {
+        try {
+            String minecraftHome = PathManager.DIR_MINECRAFT_HOME;
+            if (minecraftHome == null || minecraftHome.trim().isEmpty()) return null;
+
+            File home = new File(minecraftHome);
+            java.util.ArrayList<File> candidates = new java.util.ArrayList<>();
+
+            // These cover the common cases:
+            // - PathManager points directly at the active game directory
+            // - PathManager points at an isolated instance root
+            // - PathManager points at the global .minecraft directory
+            addOptionsCandidate(candidates, home);
+            addOptionsCandidate(candidates, new File(home, "game"));
+
+            File parent = home.getParentFile();
+            if (parent != null) {
+                addOptionsCandidate(candidates, parent);
+                addOptionsCandidate(candidates, new File(parent, "game"));
+            }
+
+            File grandparent = parent == null ? null : parent.getParentFile();
+            if (grandparent != null) {
+                addOptionsCandidate(candidates, grandparent);
+                addOptionsCandidate(candidates, new File(grandparent, "game"));
+            }
+
+            // If the launcher is in isolated-instance mode, the active options.txt
+            // usually lives under .minecraft/instances/<instance>/game/options.txt.
+            scanInstancesDirectory(candidates, new File(home, "instances"));
+            if (parent != null) scanInstancesDirectory(candidates, new File(parent, "instances"));
+            if (grandparent != null) scanInstancesDirectory(candidates, new File(grandparent, "instances"));
+
+            return newestReadableOptionsFile(candidates);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void addOptionsCandidate(@NonNull java.util.ArrayList<File> candidates, @Nullable File directory) {
+        if (directory == null) return;
+        candidates.add(new File(directory, "options.txt"));
+    }
+
+    private static void scanInstancesDirectory(@NonNull java.util.ArrayList<File> candidates, @Nullable File instancesDir) {
+        if (instancesDir == null || !instancesDir.isDirectory()) return;
+
+        File[] children;
+        try {
+            children = instancesDir.listFiles();
+        } catch (Throwable ignored) {
+            children = null;
+        }
+        if (children == null) return;
+
+        for (File instance : children) {
+            if (instance == null || !instance.isDirectory()) continue;
+            addOptionsCandidate(candidates, new File(instance, "game"));
+            addOptionsCandidate(candidates, instance);
+            addOptionsCandidate(candidates, new File(instance, ".minecraft"));
+        }
+    }
+
+    @Nullable
+    private static File newestReadableOptionsFile(@NonNull java.util.ArrayList<File> candidates) {
+        File best = null;
+        long bestModified = Long.MIN_VALUE;
+
+        for (File candidate : candidates) {
+            if (candidate == null || !candidate.isFile()) continue;
+            long modified;
+            try {
+                modified = candidate.lastModified();
+            } catch (Throwable ignored) {
+                modified = 0L;
+            }
+
+            if (best == null || modified > bestModified) {
+                best = candidate;
+                bestModified = modified;
+            }
+        }
+
+        return best;
+    }
+
+    @NonNull
+    private static String debugOptionsFileName(@Nullable File file) {
+        if (file == null) return "none";
+
+        try {
+            String path = file.getAbsolutePath();
+            String marker = File.separator + "instances" + File.separator;
+            int index = path.lastIndexOf(marker);
+            if (index >= 0) {
+                return path.substring(index + 1);
+            }
+
+            File parent = file.getParentFile();
+            return parent == null ? file.getName() : parent.getName() + File.separator + file.getName();
+        } catch (Throwable ignored) {
+            return file.getName();
+        }
+    }
+
+    @NonNull
+    private static String formatScale(float scale) {
+        int rounded = Math.round(scale);
+        if (Math.abs(scale - rounded) < 0.01f) return String.valueOf(rounded);
+        return String.format(Locale.US, "%.2f", scale);
+    }
+
+    private float resolveGameBufferWidth() {
+        try {
+            if (CallbackBridge.windowWidth > 1) return CallbackBridge.windowWidth;
+            if (CallbackBridge.physicalWidth > 1) return CallbackBridge.physicalWidth;
+        } catch (Throwable ignored) {
+        }
+        return getWidth();
+    }
+
+    private float resolveGameBufferHeight() {
+        try {
+            if (CallbackBridge.windowHeight > 1) return CallbackBridge.windowHeight;
+            if (CallbackBridge.physicalHeight > 1) return CallbackBridge.physicalHeight;
+        } catch (Throwable ignored) {
+        }
+        return getHeight();
     }
 
     private void sendKeyTap(int keyCode) {
@@ -1760,6 +2320,101 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         }
     }
 
+
+    private void sendVirtualMouseDelta(float dx, float dy) {
+        try {
+            ensureVirtualMouseCursorInBounds();
+            virtualCursorBridgeX = clamp(
+                    virtualCursorBridgeX + viewDeltaToBridgeX(dx),
+                    0f,
+                    maxCursorCoordinate(CallbackBridge.windowWidth)
+            );
+            virtualCursorBridgeY = clamp(
+                    virtualCursorBridgeY + viewDeltaToBridgeY(dy),
+                    0f,
+                    maxCursorCoordinate(CallbackBridge.windowHeight)
+            );
+            sendVirtualMouseCursorPosition();
+            postInvalidateOnAnimation();
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to move virtual mouse cursor", throwable);
+        }
+    }
+
+    private void resetVirtualMouseCursorToCenter(boolean sendToMinecraft) {
+        try {
+            float maxX = maxCursorCoordinate(CallbackBridge.windowWidth);
+            float maxY = maxCursorCoordinate(CallbackBridge.windowHeight);
+            virtualCursorBridgeX = maxX / 2f;
+            virtualCursorBridgeY = maxY / 2f;
+            virtualCursorInitialized = true;
+            if (sendToMinecraft) sendVirtualMouseCursorPosition();
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to reset virtual mouse cursor", throwable);
+        }
+    }
+
+    private void ensureVirtualMouseCursorInBounds() {
+        try {
+            float maxX = maxCursorCoordinate(CallbackBridge.windowWidth);
+            float maxY = maxCursorCoordinate(CallbackBridge.windowHeight);
+
+            if (!virtualCursorInitialized
+                    || Float.isNaN(virtualCursorBridgeX)
+                    || Float.isInfinite(virtualCursorBridgeX)
+                    || Float.isNaN(virtualCursorBridgeY)
+                    || Float.isInfinite(virtualCursorBridgeY)) {
+                resetVirtualMouseCursorToCenter(false);
+                return;
+            }
+
+            virtualCursorBridgeX = clamp(virtualCursorBridgeX, 0f, maxX);
+            virtualCursorBridgeY = clamp(virtualCursorBridgeY, 0f, maxY);
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to prepare virtual mouse cursor", throwable);
+        }
+    }
+
+    private void sendVirtualMouseCursorPosition() {
+        try {
+            ensureVirtualMouseCursorInBounds();
+            CallbackBridge.setInputReady(true);
+            CallbackBridge.mouseX = virtualCursorBridgeX;
+            CallbackBridge.mouseY = virtualCursorBridgeY;
+            CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to send virtual mouse cursor", throwable);
+        }
+    }
+
+    private float bridgeCursorToViewX(float bridgeX) {
+        float maxBridge = maxCursorCoordinate(CallbackBridge.windowWidth);
+        float maxView = Math.max(0f, getWidth() - 1f);
+        if (maxBridge <= 0f || maxView <= 0f) return 0f;
+        return clamp(bridgeX, 0f, maxBridge) * maxView / maxBridge;
+    }
+
+    private float bridgeCursorToViewY(float bridgeY) {
+        float maxBridge = maxCursorCoordinate(CallbackBridge.windowHeight);
+        float maxView = Math.max(0f, getHeight() - 1f);
+        if (maxBridge <= 0f || maxView <= 0f) return 0f;
+        return clamp(bridgeY, 0f, maxBridge) * maxView / maxBridge;
+    }
+
+    private float viewDeltaToBridgeX(float viewDx) {
+        float maxBridge = maxCursorCoordinate(CallbackBridge.windowWidth);
+        float maxView = Math.max(0f, getWidth() - 1f);
+        if (maxBridge <= 0f || maxView <= 0f) return viewDx;
+        return viewDx * maxBridge / maxView;
+    }
+
+    private float viewDeltaToBridgeY(float viewDy) {
+        float maxBridge = maxCursorCoordinate(CallbackBridge.windowHeight);
+        float maxView = Math.max(0f, getHeight() - 1f);
+        if (maxBridge <= 0f || maxView <= 0f) return viewDy;
+        return viewDy * maxBridge / maxView;
+    }
+
     private void sendAbsoluteCursor(float x, float y) {
         try {
             CallbackBridge.setInputReady(true);
@@ -1768,47 +2423,6 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
         } catch (Throwable throwable) {
             Logging.e(TAG, "Unable to send virtual mouse cursor", throwable);
-        }
-    }
-
-    private void ensureVirtualMouseCursorInBounds() {
-        try {
-            CallbackBridge.setInputReady(true);
-            float maxX = maxCursorCoordinate(CallbackBridge.windowWidth);
-            float maxY = maxCursorCoordinate(CallbackBridge.windowHeight);
-
-            boolean invalid = Float.isNaN(CallbackBridge.mouseX)
-                    || Float.isNaN(CallbackBridge.mouseY)
-                    || CallbackBridge.mouseX < 0f
-                    || CallbackBridge.mouseY < 0f
-                    || CallbackBridge.mouseX > maxX
-                    || CallbackBridge.mouseY > maxY;
-            if (invalid) {
-                CallbackBridge.mouseX = maxX / 2f;
-                CallbackBridge.mouseY = maxY / 2f;
-                CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
-            }
-        } catch (Throwable throwable) {
-            Logging.e(TAG, "Unable to prepare virtual mouse cursor", throwable);
-        }
-    }
-
-    private void sendVirtualMouseDelta(float dx, float dy) {
-        try {
-            CallbackBridge.setInputReady(true);
-            float windowWidth = Math.max(1f, CallbackBridge.windowWidth);
-            float windowHeight = Math.max(1f, CallbackBridge.windowHeight);
-            float viewWidth = Math.max(1f, getWidth());
-            float viewHeight = Math.max(1f, getHeight());
-
-            float scaledDx = dx * (windowWidth / viewWidth);
-            float scaledDy = dy * (windowHeight / viewHeight);
-
-            CallbackBridge.mouseX = clamp(CallbackBridge.mouseX + scaledDx, 0f, maxCursorCoordinate(windowWidth));
-            CallbackBridge.mouseY = clamp(CallbackBridge.mouseY + scaledDy, 0f, maxCursorCoordinate(windowHeight));
-            CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
-        } catch (Throwable throwable) {
-            Logging.e(TAG, "Unable to send fake virtual mouse delta", throwable);
         }
     }
 
@@ -1824,11 +2438,19 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     }
 
     private void sendLeftMouse(boolean down) {
+        sendMouseButton(MOUSE_BUTTON_LEFT, down, "Unable to send touch attack");
+    }
+
+    private void sendRightMouse(boolean down) {
+        sendMouseButton(MOUSE_BUTTON_RIGHT, down, "Unable to send touch use/place");
+    }
+
+    private void sendMouseButton(int button, boolean down, @NonNull String errorMessage) {
         try {
             CallbackBridge.setInputReady(true);
-            CallbackBridge.sendMouseButton(MOUSE_BUTTON_LEFT, down);
+            CallbackBridge.sendMouseButton(button, down);
         } catch (Throwable throwable) {
-            Logging.e(TAG, "Unable to send touch attack", throwable);
+            Logging.e(TAG, errorMessage, throwable);
         }
     }
 
@@ -1848,12 +2470,37 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 child.setVisibility(shouldShowControlButton(button.getData()) ? VISIBLE : INVISIBLE);
             }
         }
+        postInvalidateOnAnimation();
     }
 
     private boolean shouldShowControlButton(@NonNull TouchControlData data) {
         if (editMode || controlsVisible) return true;
         return data.visibleWhenControlsHidden
                 || TouchControlData.shouldStayVisibleWhenControlsHiddenByDefault(data.action);
+    }
+
+    private boolean hasGameCursorOverlayInViewTree() {
+        try {
+            View root = getRootView();
+            if (containsGameCursorOverlay(root)) return true;
+
+            ViewParent parent = getParent();
+            return parent instanceof View && containsGameCursorOverlay((View) parent);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private boolean containsGameCursorOverlay(@Nullable View view) {
+        if (view == null || view == this) return false;
+        if (view instanceof GameCursorOverlay) return true;
+        if (!(view instanceof ViewGroup)) return false;
+
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            if (containsGameCursorOverlay(group.getChildAt(i))) return true;
+        }
+        return false;
     }
 
     @Nullable
@@ -2036,8 +2683,8 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
     private void clearRuntimeTouchRouting() {
         cancelCameraPointer(true);
-        cancelVirtualMousePointer();
         finishHotbarPointer();
+        cancelVirtualMousePointer();
         passthroughPointerId = NO_POINTER_ID;
         passthroughDownTime = 0L;
         controlPointerTargets.clear();
@@ -2055,6 +2702,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     @Override
     protected void onDetachedFromWindow() {
         clearRuntimeTouchRouting();
+        applyAndroidPointerIconPolicy(false, true);
         super.onDetachedFromWindow();
     }
 }

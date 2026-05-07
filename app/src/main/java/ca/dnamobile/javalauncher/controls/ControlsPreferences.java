@@ -15,6 +15,8 @@ package ca.dnamobile.javalauncher.controls;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import java.io.File;
+
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
@@ -34,6 +36,10 @@ public final class ControlsPreferences {
     private static final String KEY_MINECRAFT_TOUCH_GESTURES = "minecraft_touch_gestures";
     private static final String KEY_DOUBLE_TAP_TO_DROP = "double_tap_to_drop";
 
+    private static final String KEY_MOUSE_CURSOR_STYLE = "mouse_cursor_style";
+    private static final String KEY_MOUSE_CURSOR_SIZE_PERCENT = "mouse_cursor_size_percent";
+    private static final String KEY_CUSTOM_MOUSE_CURSOR_PATH = "custom_mouse_cursor_path";
+
     private static final String KEY_HOTBAR_HITBOX_DEBUG = "hotbar_hitbox_debug";
     private static final String KEY_HOTBAR_GUI_SCALE_OVERRIDE = "hotbar_gui_scale_override";
     private static final String KEY_HOTBAR_WIDTH_GUI = "hotbar_width_gui";
@@ -47,6 +53,15 @@ public final class ControlsPreferences {
     public static final float DEFAULT_HOTBAR_X_OFFSET_DP = 0f;
     public static final float DEFAULT_HOTBAR_Y_OFFSET_DP = 0f;
     public static final float DEFAULT_HOTBAR_VERTICAL_PADDING_DP = 18f;
+
+    public static final String MOUSE_CURSOR_STYLE_CROSSHAIR = "crosshair";
+    public static final String MOUSE_CURSOR_STYLE_DOT = "dot";
+    public static final String MOUSE_CURSOR_STYLE_ARROW = "arrow";
+    public static final String MOUSE_CURSOR_STYLE_CUSTOM = "custom";
+
+    public static final int MIN_MOUSE_CURSOR_SIZE_PERCENT = 50;
+    public static final int MAX_MOUSE_CURSOR_SIZE_PERCENT = 200;
+    public static final int DEFAULT_MOUSE_CURSOR_SIZE_PERCENT = 100;
 
     private ControlsPreferences() {
     }
@@ -118,6 +133,95 @@ public final class ControlsPreferences {
 
     public static void setVirtualMouseEnabled(@NonNull Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_VIRTUAL_MOUSE_ENABLED, enabled).apply();
+    }
+
+    @NonNull
+    public static String getMouseCursorStyle(@NonNull Context context) {
+        return normalizeMouseCursorStyle(prefs(context).getString(
+                KEY_MOUSE_CURSOR_STYLE,
+                MOUSE_CURSOR_STYLE_CROSSHAIR
+        ));
+    }
+
+    public static void setMouseCursorStyle(@NonNull Context context, @Nullable String style) {
+        prefs(context).edit()
+                .putString(KEY_MOUSE_CURSOR_STYLE, normalizeMouseCursorStyle(style))
+                .apply();
+    }
+
+    public static int getMouseCursorSizePercent(@NonNull Context context) {
+        return clampInt(
+                prefs(context).getInt(KEY_MOUSE_CURSOR_SIZE_PERCENT, DEFAULT_MOUSE_CURSOR_SIZE_PERCENT),
+                MIN_MOUSE_CURSOR_SIZE_PERCENT,
+                MAX_MOUSE_CURSOR_SIZE_PERCENT
+        );
+    }
+
+    public static void setMouseCursorSizePercent(@NonNull Context context, int percent) {
+        prefs(context).edit()
+                .putInt(KEY_MOUSE_CURSOR_SIZE_PERCENT, clampInt(
+                        percent,
+                        MIN_MOUSE_CURSOR_SIZE_PERCENT,
+                        MAX_MOUSE_CURSOR_SIZE_PERCENT
+                ))
+                .apply();
+    }
+
+    @Nullable
+    public static String getCustomMouseCursorPath(@NonNull Context context) {
+        String value = prefs(context).getString(KEY_CUSTOM_MOUSE_CURSOR_PATH, null);
+        return value == null || value.trim().isEmpty() ? null : value.trim();
+    }
+
+    public static void setCustomMouseCursorPath(@NonNull Context context, @Nullable String path) {
+        SharedPreferences.Editor editor = prefs(context).edit();
+        if (path == null || path.trim().isEmpty()) {
+            editor.remove(KEY_CUSTOM_MOUSE_CURSOR_PATH);
+        } else {
+            editor.putString(KEY_CUSTOM_MOUSE_CURSOR_PATH, path.trim());
+        }
+        editor.apply();
+    }
+
+    @NonNull
+    public static File getCustomMouseCursorFile(@NonNull Context context) {
+        File dir = new File(context.getApplicationContext().getFilesDir(), "mouse_cursor");
+        if (!dir.exists()) //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+        return new File(dir, "custom_mouse_cursor.png");
+    }
+
+    public static boolean hasCustomMouseCursorIcon(@NonNull Context context) {
+        String path = getCustomMouseCursorPath(context);
+        if (path == null) return false;
+        File file = new File(path);
+        return file.isFile() && file.length() > 0L;
+    }
+
+    @NonNull
+    public static String getMouseCursorResourceName(@Nullable String style) {
+        String normalized = normalizeMouseCursorStyle(style);
+        if (MOUSE_CURSOR_STYLE_DOT.equals(normalized)) return "ic_cursor_dot";
+        if (MOUSE_CURSOR_STYLE_ARROW.equals(normalized)) return "ic_cursor_arrow";
+        return "ic_gamepad_pointer";
+    }
+
+    @NonNull
+    public static String getMouseCursorStyleLabel(@Nullable String style) {
+        String normalized = normalizeMouseCursorStyle(style);
+        if (MOUSE_CURSOR_STYLE_DOT.equals(normalized)) return "Dot crosshair";
+        if (MOUSE_CURSOR_STYLE_ARROW.equals(normalized)) return "Arrow pointer";
+        if (MOUSE_CURSOR_STYLE_CUSTOM.equals(normalized)) return "Custom image";
+        return "Crosshair";
+    }
+
+    @NonNull
+    public static String normalizeMouseCursorStyle(@Nullable String style) {
+        String value = style == null ? "" : style.trim().toLowerCase(java.util.Locale.US);
+        if (MOUSE_CURSOR_STYLE_DOT.equals(value)) return MOUSE_CURSOR_STYLE_DOT;
+        if (MOUSE_CURSOR_STYLE_ARROW.equals(value)) return MOUSE_CURSOR_STYLE_ARROW;
+        if (MOUSE_CURSOR_STYLE_CUSTOM.equals(value)) return MOUSE_CURSOR_STYLE_CUSTOM;
+        return MOUSE_CURSOR_STYLE_CROSSHAIR;
     }
 
     /**
@@ -221,4 +325,9 @@ public final class ControlsPreferences {
     private static float clamp(float value, float min, float max) {
         return Math.max(min, Math.min(max, value));
     }
+
+    private static int clampInt(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
 }
+

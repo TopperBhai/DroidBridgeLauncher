@@ -41,6 +41,7 @@ public final class LauncherPreferences {
     private static final String KEY_GAME_RESOLUTION_SCALE_PERCENT = "game_resolution_scale_percent";
     private static final String KEY_FORCE_FULLSCREEN_MODE = "force_fullscreen_mode";
     private static final String KEY_AVOID_ROUNDED_DISPLAY_CORNERS = "avoid_rounded_display_corners";
+    private static final String KEY_IGNORE_DISPLAY_CUTOUT = "ignore_display_cutout";
 
     public static final int MIN_GAME_RESOLUTION_SCALE_PERCENT = 25;
     public static final int MAX_GAME_RESOLUTION_SCALE_PERCENT = 200;
@@ -268,6 +269,18 @@ public final class LauncherPreferences {
 
     public static void setAvoidRoundedDisplayCorners(@NonNull Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_AVOID_ROUNDED_DISPLAY_CORNERS, enabled).apply();
+    }
+
+    /**
+     * Allows the game/activity window to draw into display cutout/notch areas on supported devices.
+     * Disabled by default because some phones hide UI behind camera cutouts unless the user opts in.
+     */
+    public static boolean isIgnoreDisplayCutout(@NonNull Context context) {
+        return prefs(context).getBoolean(KEY_IGNORE_DISPLAY_CUTOUT, false);
+    }
+
+    public static void setIgnoreDisplayCutout(@NonNull Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_IGNORE_DISPLAY_CUTOUT, enabled).apply();
     }
 
     /**

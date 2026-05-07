@@ -12,6 +12,7 @@
 
 package ca.dnamobile.javalauncher.input;
 
+import android.content.Context;
 import android.view.Choreographer;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -22,6 +23,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import ca.dnamobile.javalauncher.feature.log.Logging;
+import ca.dnamobile.javalauncher.settings.LauncherPreferences;
 
 import java.util.EnumMap;
 
@@ -67,9 +69,10 @@ public final class GamepadInputController {
     }
 
     private final Choreographer choreographer = Choreographer.getInstance();
+    private final Context appContext;
     private final GamepadMappingStore mappingStore;
     private final MappingRequestListener mappingRequestListener;
-    private final EnumMap<GamepadButton, ActiveMappedAction> activeButtonActions = new EnumMap<>(GamepadButton.class);
+    private final EnumMap<GamepadButton, ActiveMappedAction[]> activeButtonActions = new EnumMap<>(GamepadButton.class);
 
     private boolean removed;
     private long lastFrameNanos = System.nanoTime();
@@ -110,6 +113,7 @@ public final class GamepadInputController {
     }
 
     public GamepadInputController(@NonNull View hostView, MappingRequestListener mappingRequestListener) {
+        appContext = hostView.getContext().getApplicationContext();
         mappingStore = GamepadMappingStore.get(hostView.getContext());
         this.mappingRequestListener = mappingRequestListener;
 
@@ -315,9 +319,10 @@ public final class GamepadInputController {
 
         float sensitivity = BASE_GAME_CAMERA_SENSITIVITY
                 * mappingStore.getGameCameraSensitivityMultiplier();
+        float coordinateScale = getResolutionCoordinateScale();
 
-        float deltaX = rightX * acceleration * sensitivity * deltaScale;
-        float deltaY = rightY * acceleration * sensitivity * deltaScale;
+        float deltaX = rightX * acceleration * sensitivity * coordinateScale * deltaScale;
+        float deltaY = rightY * acceleration * sensitivity * coordinateScale * deltaScale;
 
         org.lwjgl.glfw.CallbackBridge.mouseX += deltaX;
         org.lwjgl.glfw.CallbackBridge.mouseY += deltaY;
@@ -342,19 +347,21 @@ public final class GamepadInputController {
         float dy = 0f;
 
         float sensitivityMultiplier = mappingStore.getMenuCursorSensitivityMultiplier();
+        float coordinateScale = getResolutionCoordinateScale();
 
         if (x != 0f || y != 0f) {
             float magnitude = Math.min(1f, (float) Math.sqrt(x * x + y * y));
             float acceleration = Math.max(0.35f, magnitude * magnitude);
             float sensitivity = BASE_MENU_CURSOR_SENSITIVITY * sensitivityMultiplier;
-            dx += x * acceleration * sensitivity * deltaScale;
-            dy += y * acceleration * sensitivity * deltaScale;
+            dx += x * acceleration * sensitivity * coordinateScale * deltaScale;
+            dy += y * acceleration * sensitivity * coordinateScale * deltaScale;
         }
 
         // Only repeat D-pad cursor movement when that D-pad direction is actually mapped
         // to a Cursor action. This fixes remapped D-pad buttons still behaving like a joystick.
         float cursorRepeatScale = (BASE_DPAD_CURSOR_STEP / CURSOR_ACTION_BASE_STEP)
                 * sensitivityMultiplier
+                * coordinateScale
                 * deltaScale;
         float[] dpadDelta = addDpadCursorRepeat(cursorRepeatScale);
         dx += dpadDelta[0];
@@ -363,6 +370,44 @@ public final class GamepadInputController {
         if (dx != 0f || dy != 0f) {
             GamepadAction.moveCursorBy(dx, dy);
         }
+    }
+
+    /**
+     * Controller-generated mouse deltas are sent in Minecraft window coordinates.
+     * When the launcher resolution scaler lowers the game window, Android stretches
+     * that smaller buffer back to the full screen. Without this correction, 67%
+     * render scale makes the gamepad cursor feel roughly 1 / 0.67 times faster.
+     *
+     * Return the inverse stretch: 67% => 0.67, 100% => 1.0, 150% => 1.5.
+     */
+    private float getResolutionCoordinateScale() {
+        try {
+            float windowWidth = org.lwjgl.glfw.CallbackBridge.windowWidth;
+            float windowHeight = org.lwjgl.glfw.CallbackBridge.windowHeight;
+            float physicalWidth = org.lwjgl.glfw.CallbackBridge.physicalWidth;
+            float physicalHeight = org.lwjgl.glfw.CallbackBridge.physicalHeight;
+
+            if (windowWidth > 1f && windowHeight > 1f && physicalWidth > 1f && physicalHeight > 1f) {
+                float x = clamp(windowWidth / physicalWidth, 0.25f, 4f);
+                float y = clamp(windowHeight / physicalHeight, 0.25f, 4f);
+                float scale = Math.min(x, y);
+
+                if (Math.abs(scale - 1f) > 0.025f) {
+                    return scale;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            return clamp(LauncherPreferences.getGameResolutionScalePercent(appContext) / 100f, 0.25f, 4f);
+        } catch (Throwable ignored) {
+            return 1f;
+        }
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     @NonNull
@@ -382,10 +427,12 @@ public final class GamepadInputController {
             float scale
     ) {
         if (!pressed) return;
-        GamepadAction action = mappingStore.getButtonAction(button, false, activeDevice);
-        if (!action.isCursorAction()) return;
-        delta[0] += action.getCursorDx() * scale;
-        delta[1] += action.getCursorDy() * scale;
+        GamepadAction[] actions = mappingStore.getButtonActions(button, false, activeDevice);
+        for (GamepadAction action : actions) {
+            if (action == null || !action.isCursorAction()) continue;
+            delta[0] += action.getCursorDx() * scale;
+            delta[1] += action.getCursorDy() * scale;
+        }
     }
 
     private void updateDirection() {
@@ -457,60 +504,103 @@ public final class GamepadInputController {
             boolean isDown,
             @Nullable InputDevice device
     ) {
-        ActiveMappedAction mapped;
+        ActiveMappedAction[] mapped;
 
         if (isDown) {
-            mapped = resolveMappedAction(button, device);
+            mapped = resolveMappedActions(button, device);
             activeButtonActions.put(button, mapped);
         } else {
             mapped = activeButtonActions.remove(button);
             if (mapped == null) {
                 // Fallback for devices that send an UP without the matching DOWN.
-                mapped = resolveMappedAction(button, device);
+                mapped = resolveMappedActions(button, device);
             }
         }
 
-        if (isDown && !mapped.gameMode && mapped.action == GamepadAction.ESCAPE) {
+        if (isDown && containsMenuEscape(mapped)) {
             prepareForLikelyMenuCloseFromController(button);
         }
 
         Logging.i(TAG, "Button=" + button + ", down=" + isDown
-                + ", gameMode=" + mapped.gameMode
                 + ", profile=" + mappingStore.profileKeyForDevice(device)
-                + ", action=" + mapped.action.name()
+                + ", actions=" + describeMappedActions(mapped)
                 + ", cursor=" + org.lwjgl.glfw.CallbackBridge.mouseX + ","
                 + org.lwjgl.glfw.CallbackBridge.mouseY);
 
-        mapped.action.perform(isDown, mapped.pulseMenuMouseClick);
+        performMappedActions(mapped, isDown);
     }
 
     @NonNull
-    private ActiveMappedAction resolveMappedAction(
+    private ActiveMappedAction[] resolveMappedActions(
             @NonNull GamepadButton button,
             @Nullable InputDevice device
     ) {
         boolean gameMode = isGameMode();
-        GamepadAction action = mappingStore.getButtonAction(button, gameMode, device);
+        GamepadAction[] actions = mappingStore.getButtonActions(button, gameMode, device);
+        ActiveMappedAction[] mapped = new ActiveMappedAction[actions.length];
 
-        // Guard against old saved prefs from earlier patches where menu A/R2 were ENTER.
-        // Those prefs survive reinstall/rebuild and make it look like A is not mapped to click.
-        if (!gameMode && (button == GamepadButton.BUTTON_A
-                || button == GamepadButton.BUTTON_R2
-                || button == GamepadButton.DPAD_CENTER)
-                && action == GamepadAction.ENTER) {
-            Logging.i(TAG, "Overriding old menu " + button + " ENTER mapping to MOUSE_LEFT");
-            action = GamepadAction.MOUSE_LEFT;
+        for (int slot = 0; slot < actions.length; slot++) {
+            GamepadAction action = actions[slot] == null ? GamepadAction.NONE : actions[slot];
+
+            // Guard against old saved prefs from earlier patches where menu A/R2 were ENTER.
+            // Those prefs survive reinstall/rebuild and make it look like A is not mapped to click.
+            if (!gameMode && (button == GamepadButton.BUTTON_A
+                    || button == GamepadButton.BUTTON_R2
+                    || button == GamepadButton.DPAD_CENTER)
+                    && action == GamepadAction.ENTER) {
+                Logging.i(TAG, "Overriding old menu " + button + " slot " + slot + " ENTER mapping to MOUSE_LEFT");
+                action = GamepadAction.MOUSE_LEFT;
+            }
+
+            boolean pulseMenuMouseClick = !gameMode && action.isMouseButton();
+            mapped[slot] = new ActiveMappedAction(action, pulseMenuMouseClick, gameMode);
         }
+        return mapped;
+    }
 
-        boolean pulseMenuMouseClick = !gameMode && action.isMouseButton();
-        return new ActiveMappedAction(action, pulseMenuMouseClick, gameMode);
+    private static boolean containsMenuEscape(@NonNull ActiveMappedAction[] mapped) {
+        for (ActiveMappedAction action : mapped) {
+            if (action != null && !action.gameMode && action.action == GamepadAction.ESCAPE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void performMappedActions(@NonNull ActiveMappedAction[] mapped, boolean isDown) {
+        if (isDown) {
+            for (ActiveMappedAction action : mapped) {
+                if (action != null && action.action != GamepadAction.NONE) {
+                    action.action.perform(true, action.pulseMenuMouseClick);
+                }
+            }
+        } else {
+            for (int i = mapped.length - 1; i >= 0; i--) {
+                ActiveMappedAction action = mapped[i];
+                if (action != null && action.action != GamepadAction.NONE) {
+                    action.action.perform(false, action.pulseMenuMouseClick);
+                }
+            }
+        }
+    }
+
+    @NonNull
+    private static String describeMappedActions(@NonNull ActiveMappedAction[] mapped) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < mapped.length; i++) {
+            ActiveMappedAction action = mapped[i];
+            if (action == null || action.action == GamepadAction.NONE) continue;
+            if (builder.length() > 0) builder.append(" + ");
+            builder.append(i).append(":").append(action.action.name());
+        }
+        return builder.length() == 0 ? "NONE" : builder.toString();
     }
 
     private void releaseAllMappedButtons() {
         if (activeButtonActions.isEmpty()) return;
-        for (ActiveMappedAction mapped : activeButtonActions.values()) {
+        for (ActiveMappedAction[] mapped : activeButtonActions.values()) {
             if (mapped != null) {
-                mapped.action.perform(false, mapped.pulseMenuMouseClick);
+                performMappedActions(mapped, false);
             }
         }
         activeButtonActions.clear();
